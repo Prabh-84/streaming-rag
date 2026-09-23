@@ -45,7 +45,12 @@ class Settings(BaseSettings):
 
     # --- Retrieval Controller (REQ-CTRL-01/02/03) ---
     stability_threshold: float = Field(default=0.90, alias="STABILITY_THRESHOLD")
+    # "inter-chunk cosine similarity" over "the last 2 chunks" (PRD_TRD.md §5.4
+    # WAIT -> PROVISIONAL_RETRIEVE guard; REQ-CTRL-01's own wording is the single-pair
+    # reading this generalizes from).
+    stability_window: int = Field(default=2, ge=2, alias="STABILITY_WINDOW")
     max_wait_chunks: int = Field(default=6, alias="MAX_WAIT_CHUNKS")
+    reorder_window_ms: int = Field(default=2000, ge=0, alias="REORDER_WINDOW_MS")
 
     # --- Multi-Intent Decomposer (REQ-INTENT-01/02) ---
     merge_threshold: float = Field(default=0.85, alias="MERGE_THRESHOLD")

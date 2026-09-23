@@ -1,9 +1,9 @@
 """FastAPI app factory and process entrypoint.
 
-App construction, structured logging setup, and the health endpoints required by REQ-DEPLOY-01
-(/health liveness, /ready readiness — now also gating on embedder warmup, post-Phase-2 sync).
-Business-logic routers (app/api/session.py, stream.py, events.py, evaluate.py) and corpus
-ingestion (scripts/ingest_corpus.py) are later phases and are not wired in here yet.
+App construction, structured logging, health endpoints (REQ-DEPLOY-01), and the composition root
+that wires the Phase 2 retrieval primitives + Phase 3 session store into app.state for the
+session/stream routers. Corpus ingestion (scripts/ingest_corpus.py) is still Phase 10's job to
+call from here; it runs via the CLI until then.
 """
 
 from __future__ import annotations
@@ -16,8 +16,15 @@ import structlog
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from app.api import session as session_router
+from app.api import stream as stream_router
+from app.controller import entity_extraction
 from app.core.config import get_settings
 from app.core.embeddings import get_embedder
+from app.retrieval.dense import DenseIndex, create_qdrant_client
+from app.retrieval.hybrid import HybridRetriever
+from app.retrieval.sparse_bm25 import SparseIndexRegistry
+from app.session.session_store import SessionStore
 
 structlog.configure(
     processors=[
@@ -42,18 +49,49 @@ async def _warm_embedder(app: FastAPI) -> None:
         log.exception("embedder_warmup_failed")
 
 
+async def _warm_nlp(app: FastAPI) -> None:
+    """Load the spaCy model once at startup, for the same reason as _warm_embedder — a cold
+    spaCy load on the first transcript chunk would blow the <150ms time-to-first-retrieval-decision
+    budget (PRD_TRD.md §5.3, REQ-STREAM-01)."""
+    try:
+        await asyncio.to_thread(entity_extraction.warmup)
+        app.state.nlp_warm = True
+        log.info("nlp_warm")
+    except Exception:
+        log.exception("nlp_warmup_failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     log.info("startup", embedding_model=settings.embedding_model, qdrant_url=settings.qdrant_url)
+
     app.state.embedder_warm = False
-    warmup_task = asyncio.create_task(_warm_embedder(app))
+    app.state.nlp_warm = False
+    warmup_tasks = [
+        asyncio.create_task(_warm_embedder(app)),
+        asyncio.create_task(_warm_nlp(app)),
+    ]
+
     # Phase 10 (PRD_TRD.md §10) wires scripts/ingest_corpus.py's ingest_corpus() into this startup
     # event as a background task, per REQ-DEPLOY-01 (async ingestion, never blocking the port
     # bind), and sets this flag from its outcome. Until then ingestion runs via the CLI.
     app.state.ingestion_complete = True
+
+    # Composition root for Phase 3: one shared retriever + session store per process. Construction
+    # is cheap (no I/O until first use) and reuses the already-warmed embedder singleton.
+    app.state.session_store = SessionStore(settings)
+    qdrant_client = create_qdrant_client(settings.qdrant_url)
+    dense_index = DenseIndex(qdrant_client, get_embedder(), settings)
+    sparse_index = SparseIndexRegistry(settings)
+    app.state.sparse_index = sparse_index
+    app.state.hybrid_retriever = HybridRetriever(dense_index, sparse_index, settings)
+
     yield
-    warmup_task.cancel()
+
+    for task in warmup_tasks:
+        task.cancel()
+    await qdrant_client.close()
     log.info("shutdown")
 
 
@@ -71,6 +109,8 @@ def _check_qdrant(qdrant_url: str) -> bool:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Streaming Live RAG", version="0.1.0", lifespan=lifespan)
+    app.include_router(session_router.router)
+    app.include_router(stream_router.router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -80,17 +120,19 @@ def create_app() -> FastAPI:
     @app.get("/ready")
     async def ready() -> JSONResponse:
         """Readiness — gates on live Qdrant connectivity, ingestion having completed once, and
-        the embedding model being warmed (REQ-DEPLOY-01)."""
+        the embedding + spaCy models being warmed (REQ-DEPLOY-01)."""
         settings = get_settings()
         qdrant_ok = _check_qdrant(settings.qdrant_url)
         ingestion_ok = bool(getattr(app.state, "ingestion_complete", False))
         embedder_ok = bool(getattr(app.state, "embedder_warm", False))
-        is_ready = qdrant_ok and ingestion_ok and embedder_ok
+        nlp_ok = bool(getattr(app.state, "nlp_warm", False))
+        is_ready = qdrant_ok and ingestion_ok and embedder_ok and nlp_ok
         body = {
             "status": "ready" if is_ready else "not_ready",
             "qdrant": qdrant_ok,
             "ingestion": ingestion_ok,
             "embedder": embedder_ok,
+            "nlp": nlp_ok,
         }
         return JSONResponse(content=body, status_code=200 if is_ready else 503)
 

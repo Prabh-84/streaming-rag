@@ -57,8 +57,15 @@ class HybridRetriever:
         self._sink = sink
         self._semaphore = asyncio.Semaphore(self._settings.max_concurrent_retrievals)
 
-    async def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
+    async def retrieve(
+        self, request: RetrievalRequest, *, sink: EventSink | None = None
+    ) -> RetrievalResult:
+        """`sink` overrides the sink this HybridRetriever was constructed with, for this call
+        only. One shared retriever instance (e.g. the process-wide app.state one) has no single
+        fixed telemetry destination — each WebSocket connection routes events to its own
+        session's queue, so the caller supplies that per call rather than per instance."""
         s = self._settings
+        effective_sink = sink if sink is not None else self._sink
         async with self._semaphore:
             dense, sparse = await asyncio.gather(
                 self._run_mode(
@@ -70,6 +77,7 @@ class HybridRetriever:
                         s.k_dense,
                         timeout_ms=s.retrieval_timeout_ms,
                     ),
+                    effective_sink,
                 ),
                 self._run_mode(
                     request,
@@ -80,6 +88,7 @@ class HybridRetriever:
                         s.k_sparse,
                         timeout_ms=s.retrieval_timeout_ms,
                     ),
+                    effective_sink,
                 ),
             )
         return RetrievalResult(
@@ -97,8 +106,10 @@ class HybridRetriever:
         request: RetrievalRequest,
         mode: RetrievalMode,
         search: Callable[[], Awaitable[list[RetrievedChunk]]],
+        sink: EventSink | None,
     ) -> _ModeOutcome:
         self._emit(
+            sink,
             request,
             EventType.RETRIEVAL_STARTED,
             {
@@ -131,6 +142,7 @@ class HybridRetriever:
             trigger=request.trigger,
         )
         self._emit(
+            sink,
             request,
             EventType.RETRIEVAL_COMPLETED,
             {
@@ -146,6 +158,7 @@ class HybridRetriever:
         )
         if error is not None:
             self._emit(
+                sink,
                 request,
                 EventType.ERROR,
                 {
@@ -159,12 +172,16 @@ class HybridRetriever:
         return _ModeOutcome(hits=hits, event=event, error=error)
 
     def _emit(
-        self, request: RetrievalRequest, event_type: EventType, payload: dict[str, Any]
+        self,
+        sink: EventSink | None,
+        request: RetrievalRequest,
+        event_type: EventType,
+        payload: dict[str, Any],
     ) -> None:
-        if self._sink is None:
+        if sink is None:
             return
         try:
-            self._sink(
+            sink(
                 TelemetryEvent(
                     session_id=request.session_id,
                     trace_id=request.trace_id,
