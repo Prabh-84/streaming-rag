@@ -68,7 +68,7 @@ This table is the traceability matrix required by the specification freeze — e
 | REQ-OBS-05 | `app/models/retrieval_event.py` | `test_retrieval_event_trigger_tagging` | G6 |
 | REQ-SEC-01–05 | `app/session/session_store.py`, `app/api/deps.py` | `test_session_isolation` | G5 |
 | REQ-SEC-06 | `app/api/deps.py`, `app/api/stream.py` | `test_ws_query_token_auth` | — |
-| REQ-DEPLOY-01 | `app/main.py`, `docker/Dockerfile` | `test_health_always_200`, `test_ready_gates_on_ingestion` | G1 |
+| REQ-DEPLOY-01 | `app/main.py`, `docker/Dockerfile` | `test_health_always_200`, `test_ready_gates_on_qdrant_connectivity`, `test_ready_ok_when_qdrant_ingestion_and_embedder_ready`, `test_ready_stays_not_ready_while_embedder_is_not_yet_warm`, `test_ready_stays_not_ready_when_warmup_fails` | G1 |
 | REQ-DEPLOY-02 | `.github/workflows/ci.yml` | CI job `lint` | G1 |
 
 ## 4. Evaluation methodology

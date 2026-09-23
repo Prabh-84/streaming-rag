@@ -89,7 +89,8 @@ class FakeEmbedder:
         return [hash_vector(t, self.dimension) for t in texts]
 
     def warmup(self) -> None:
-        return None
+        if self._delay_s:
+            time.sleep(self._delay_s)
 
 
 class RecordingSink:

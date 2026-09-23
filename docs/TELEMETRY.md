@@ -26,8 +26,8 @@ Every telemetry event and every WebSocket server→client frame shares one envel
 | `TRANSCRIPT_CHUNK` | `seq, text_delta, t_offset_ms, is_final` | Client (inbound) |
 | `RETRIEVAL_DECISION` | `decision` (WAIT\|RETRIEVE\|NO_RETRIEVAL), `trigger`, `reason` | Retrieval Controller |
 | `SUBQUERY_CREATED` | `sub_query_id, text, intent_label` | Multi-Intent Decomposer |
-| `RETRIEVAL_STARTED` | `sub_query_id, mode` (dense\|sparse), `t_offset_ms` | Hybrid Retriever |
-| `RETRIEVAL_COMPLETED` | `sub_query_id, mode, result_count, latency_ms` | Hybrid Retriever |
+| `RETRIEVAL_STARTED` | `sub_query_id, mode` (dense\|sparse), `t_offset_ms, trigger` | Hybrid Retriever |
+| `RETRIEVAL_COMPLETED` | `sub_query_id, mode, result_count, latency_ms, result_chunk_ids, scores, t_offset_ms, trigger` **(fields completed, see below)** | Hybrid Retriever |
 | `RERANK_COMPLETED` | `sub_query_id, ranked_chunk_ids, scores` | Reranker |
 | `CITATION_CREATED` | `chunk_id, doc_id, section, claim_text` | Grounding Validator |
 | `ANSWER_VERSION_CREATED` | `version_no, text, citations[], supersedes` | Session-Aware Synthesis |
@@ -36,6 +36,8 @@ Every telemetry event and every WebSocket server→client frame shares one envel
 | `ERROR` | `stage, error_type, message, recoverable` | Any stage |
 | `SESSION_UPDATED` | `field, old_value, new_value` | Session Store |
 | `SESSION_RESYNC` **(NEW)** | `latest_answer_version, entities, last_seq` | API layer, on WebSocket reconnect to an existing session (REQ-STREAM-03) |
+
+**Post-freeze correction (Phase 2 sync):** `RETRIEVAL_STARTED`/`RETRIEVAL_COMPLETED`'s original field lists were incomplete against REQ-OBS-02, which already required the trace to cover "retrieval decisions and triggers" and "retrieved chunk IDs and scores" — `result_chunk_ids` and `scores` are also what the Retrieval Precision/Recall formulas (§5) are computed from, and `trigger` is what distinguishes a `multi_intent` sub-query retrieval from the turn's controller-level trigger (§2.1). These fields were already implemented (`app/retrieval/hybrid.py`); only this table was out of date.
 
 ### 2.1 `RetrievalEvent.trigger` enum (persisted record backing `RETRIEVAL_STARTED`/`RETRIEVAL_COMPLETED`)
 

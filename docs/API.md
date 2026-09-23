@@ -125,6 +125,6 @@ Exact gate definitions, metric formulas, and REQ-ID mapping: `EVALUATION.md`.
 ## 9. Health and readiness (REQ-DEPLOY-01)
 
 - `GET /health` — liveness. Returns `200` immediately, no dependency checks, never blocked by corpus ingestion.
-- `GET /ready` — readiness. Returns `503` until both Qdrant connectivity is confirmed AND corpus ingestion has completed at least once; orchestrators/compose health probes intended to gate real traffic must target this endpoint, not `/health`.
+- `GET /ready` — readiness. Returns `503` until Qdrant connectivity is confirmed, corpus ingestion has completed at least once, AND the embedding model has finished warming up (loaded once at startup, PRD_TRD.md §5.4 REQ-DEPLOY-01) — response body: `{"status": "ready"|"not_ready", "qdrant": bool, "ingestion": bool, "embedder": bool}`. Orchestrators/compose health probes intended to gate real traffic must target this endpoint, not `/health`.
 
 Neither endpoint requires authentication (used by infrastructure health checks).

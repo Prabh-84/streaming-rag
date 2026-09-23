@@ -29,6 +29,12 @@ No resolution weakens corpus isolation, session isolation, or any G1–G6 gate. 
 
 **Post-freeze correction (Phase 2):** §7's "IDs are ULIDs unless noted" made `Document.doc_id` and `Chunk.chunk_id` impossible to implement: Qdrant rejects ULID strings as point ids (verified: `ValueError: Point id ... is not a valid UUID`), yet §7.13 requires point id = `chunk_id`; and time-random ULIDs contradict the Definition of Done's "idempotent re-run produces the same chunk/embedding set". §7.1 and §7.2 now note deterministic ids (path-derived `doc_id`, UUIDv5 `chunk_id`). All other ids remain ULIDs; no other section changed, no gate affected.
 
+**Post-freeze correction (Phase 2 sync, item 1 — chunk list filename):** §9's repo tree listed the per-corpus artifact as `chunks.jsonl` (unscoped), left over from before `corpus_id` became a first-class scoping dimension (resolution #8) — inconsistent with the `bm25__<corpus_id>.pkl` naming on the very same line. The implementation's `chunks__<corpus_id>.jsonl` (and `manifest__<corpus_id>.json`, also previously unlisted) is correct and is now what §9 documents. Naming only; no behavior, gate, or architecture change.
+
+**Post-freeze correction (Phase 2 sync, item 2 — RETRIEVAL_COMPLETED telemetry fields):** `docs/TELEMETRY.md`'s event table listed `RETRIEVAL_COMPLETED` as `sub_query_id, mode, result_count, latency_ms` only, omitting `result_chunk_ids` and `scores` — but REQ-OBS-02 (§5.1) already required the trace to cover "retrieved chunk IDs and scores," and the Retrieval Precision/Recall formulas (`docs/TELEMETRY.md` §5) are computed from exactly those fields. The table was incomplete, not the implementation (`app/retrieval/hybrid.py` already emitted them). `docs/TELEMETRY.md` §2 updated; no field removed, no new REQ-ID needed.
+
+**Post-freeze correction (Phase 2 sync, item 3 — embedder warmup):** REQ-DEPLOY-01 amended (§5.4) to require the embedding model be warmed at startup, alongside ingestion, for the reason given there. `app/main.py`'s existing startup event now also does this; `/ready`'s response body gains an `embedder` field (`docs/API.md` §9 updated to match).
+
 ## 1. Executive summary & problem (Theme 4 Guide §1, original PRD §1.1–1.2)
 
 Streaming Live RAG is a backend engine that answers a user's spoken or typed request while it is still arriving. It consumes timestamped transcript chunks, decides per chunk whether to retrieve, decomposes compound requests into independent sub-queries, retrieves only from a supplied corpus, fuses and reranks evidence, and streams a grounded answer whose every factual claim carries a corpus citation. Late constraints refine the existing answer instead of restarting the pipeline.
@@ -280,13 +286,13 @@ Full schemas live in `docs/TELEMETRY.md` (event catalog, metrics) and `docs/API.
 
 ### 5.4 Deployment (REQ-DEPLOY-*) — NEW
 
-**REQ-DEPLOY-01 — Async startup ingestion, health/readiness split (resolution #9)**
-- Description: corpus ingestion must not block the process from binding its port or from answering liveness checks.
+**REQ-DEPLOY-01 — Async startup ingestion, health/readiness split, embedder warmup (resolution #9; amended post-Phase-2 sync, see §0)**
+- Description: corpus ingestion must not block the process from binding its port or from answering liveness checks. The embedding model must also be loaded at startup, not on the first query — §5.3's TTFT (<1200ms p50) and the embedding call's own timeout (`EMBEDDING_TIMEOUT_MS`=500ms) both assume a warm model; a cold `sentence-transformers` load (seconds) would fail the first real request against either budget.
 - Input: container start.
-- Expected: `uvicorn` binds immediately; `GET /health` returns 200 unconditionally (liveness); ingestion runs as a FastAPI `startup` event, async; `GET /ready` returns 503 until Qdrant connectivity is confirmed AND ingestion has completed at least once (readiness).
-- Output: `/health` always fast; `/ready` gates real traffic.
-- Failure: ingestion failure at startup logs `ERROR` and keeps `/ready` at 503 indefinitely (container stays up for diagnosis, doesn't crash-loop).
-- Test: `test_health_always_200`, `test_ready_gates_on_ingestion`.
+- Expected: `uvicorn` binds immediately; `GET /health` returns 200 unconditionally (liveness); ingestion and the embedder warmup (`app.core.embeddings.get_embedder().warmup()`) both run as background tasks started from the FastAPI `startup` event, neither blocking the port bind; `GET /ready` returns 503 until Qdrant connectivity is confirmed AND ingestion has completed at least once AND the embedder has finished warming (readiness).
+- Output: `/health` always fast; `/ready` gates real traffic, including the first embedding call.
+- Failure: ingestion failure or warmup failure at startup logs `ERROR` and keeps `/ready` at 503 indefinitely (container stays up for diagnosis, doesn't crash-loop).
+- Test: `test_health_always_200`, `test_ready_gates_on_qdrant_connectivity`, `test_ready_ok_when_qdrant_ingestion_and_embedder_ready`, `test_ready_stays_not_ready_while_embedder_is_not_yet_warm`, `test_ready_stays_not_ready_when_warmup_fails`.
 
 **REQ-DEPLOY-02 — Lint in CI (resolution #10)**
 - Description: Definition of Done requires CI to run lint; tool must be named.
@@ -435,7 +441,7 @@ Two-service system (`app`, `qdrant`). BM25 index(es) and SQLite live inside the 
   seed_data.py                       # optional demo corpus for local smoke-testing
 /data
   corpus/<corpus_id>/               # raw supplied documents + slots.yaml (read-only input)
-  processed/                          # chunks.jsonl, bm25__<corpus_id>.pkl (generated, gitignored)
+  processed/                          # chunks__<corpus_id>.jsonl, bm25__<corpus_id>.pkl, manifest__<corpus_id>.json (generated, gitignored)
 /docker
   Dockerfile                          # CMD is uvicorn only; ingestion runs in-process at startup
   docker-compose.yml
