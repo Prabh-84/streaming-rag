@@ -1,0 +1,9 @@
+corpus_id: alpha
+description: SYNTHETIC TEST FIXTURE (fictional venues). Not production data.
+slots:
+  - name: venue
+    patterns: ["Orion Hall", "Lumen Pavilion"]
+    value_type: categorical
+  - name: capacity
+    patterns: ["guests", "people", "seats"]
+    value_type: numeric

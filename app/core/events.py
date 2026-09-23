@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -63,3 +63,10 @@ class TelemetryEvent(BaseModel):
     trace_id: str
 
     model_config = {"frozen": True}
+
+
+class EventSink(Protocol):
+    """Destination for TelemetryEvents. Implementations must not block (REQ-OBS-04): the Phase 8
+    event logger satisfies this with a non-blocking asyncio.Queue put."""
+
+    def __call__(self, event: TelemetryEvent) -> None: ...

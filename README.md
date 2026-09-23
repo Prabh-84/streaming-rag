@@ -4,7 +4,9 @@ Full specification: [`PRD_TRD.md`](PRD_TRD.md), [`docs/ARCHITECTURE.md`](docs/AR
 
 ## Status
 
-**Phase 1 (Foundation) complete.** Config, data models, telemetry envelope, corpus slot-schema loader, health/readiness endpoints, and the Docker/CI skeleton exist. Business logic (controller, decomposition, retrieval, grounding, session refinement, generation) is not implemented yet — see `PRD_TRD.md` §10 for the phase plan.
+**Phases 1–2 complete.** Foundation (config, data models, telemetry envelope, health/readiness, Docker/CI) plus corpus ingestion and retrieval: per-corpus `slots.yaml` validation, chunking with deterministic ids, bge-small embeddings, Qdrant dense index, per-corpus BM25 sparse index, and a hybrid (dense + sparse) retrieval primitive, all scoped by `corpus_id`. Not yet implemented: retrieval controller, decomposition, fusion/reranking, grounding, session refinement, generation, API routes — see `PRD_TRD.md` §10.
+
+No production corpus has been supplied yet; see [`data/corpus/README.md`](data/corpus/README.md) for where it goes.
 
 ## Local development (without Docker)
 
@@ -36,13 +38,33 @@ curl http://localhost:8000/health   # {"status":"ok"} — liveness, no dependenc
 curl http://localhost:8000/ready    # {"status":"ready","qdrant":true,"ingestion":true} once Qdrant is reachable
 ```
 
+## Corpus ingestion
+
+Put a corpus at `data/corpus/<corpus_id>/` (layout: [`data/corpus/README.md`](data/corpus/README.md)), then:
+
+```bash
+python scripts/ingest_corpus.py --corpus-id <corpus_id>   # or --all; --force to rebuild
+# inside Docker:
+docker compose -f docker/docker-compose.yml exec app python scripts/ingest_corpus.py --all
+```
+
+Outputs: Qdrant points in `corpus_chunks` (payload carries `corpus_id`), plus `data/processed/bm25__<corpus_id>.pkl`, `chunks__<corpus_id>.jsonl`, and `manifest__<corpus_id>.json`. An unchanged corpus re-ingests as a no-op. Malformed input (missing/invalid `slots.yaml`, non-UTF-8 documents, no supported documents) exits 1 with a structured error and writes nothing.
+
 ## Tests and lint
 
 ```bash
 ./.venv/Scripts/python -m pytest -v
 ./.venv/Scripts/python -m ruff check .
+./.venv/Scripts/python -m ruff format --check .
 ```
 
-## Corpus ingestion, benchmark run, production deployment
+Unit tests use a deterministic fake embedder and Qdrant's in-memory mode — no model download, no server. Two opt-in integration suites exercise the real pieces:
 
-Not yet implemented (`scripts/ingest_corpus.py`, `scripts/run_benchmark.py` are Phase 2 and Phase 9 respectively). This section will be filled in as those phases land, per `docs/EVALUATION.md` §7 (Definition of Done).
+```bash
+docker compose -f docker/docker-compose.yml up -d qdrant   # tests/integration/test_qdrant_server.py runs when this is up
+RUN_MODEL_TESTS=1 ./.venv/Scripts/python -m pytest tests/integration/test_embedding_model.py   # downloads bge-small
+```
+
+## Benchmark run, production deployment
+
+Not yet implemented (`scripts/run_benchmark.py` is Phase 9; deployment hardening is Phase 10), per `docs/EVALUATION.md` §7 (Definition of Done).

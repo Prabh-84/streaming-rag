@@ -27,6 +27,8 @@ No resolution weakens corpus isolation, session isolation, or any G1–G6 gate. 
 
 **Post-freeze correction (Phase 1 post-check):** `SessionState` (§7.8) was missing `corpus_id`, discovered when implementing the Phase 1 Pydantic model. REQ-CORPUS-02 requires every retrieval call within a session to scope by `corpus_id`, but retrieval happens on later turns, separate from the `POST /session` call that supplies it — `SessionState` is the only object carried across a session's turns, so `corpus_id` must live there or REQ-CORPUS-02 cannot be implemented. Added `corpus_id` to §7.8 and clarified REQ-CORPUS-02's Input line accordingly; no other section changed, no gate affected, no architecture redesign.
 
+**Post-freeze correction (Phase 2):** §7's "IDs are ULIDs unless noted" made `Document.doc_id` and `Chunk.chunk_id` impossible to implement: Qdrant rejects ULID strings as point ids (verified: `ValueError: Point id ... is not a valid UUID`), yet §7.13 requires point id = `chunk_id`; and time-random ULIDs contradict the Definition of Done's "idempotent re-run produces the same chunk/embedding set". §7.1 and §7.2 now note deterministic ids (path-derived `doc_id`, UUIDv5 `chunk_id`). All other ids remain ULIDs; no other section changed, no gate affected.
+
 ## 1. Executive summary & problem (Theme 4 Guide §1, original PRD §1.1–1.2)
 
 Streaming Live RAG is a backend engine that answers a user's spoken or typed request while it is still arriving. It consumes timestamped transcript chunks, decides per chunk whether to retrieve, decomposes compound requests into independent sub-queries, retrieves only from a supplied corpus, fuses and reranks evidence, and streams a grounded answer whose every factual claim carries a corpus citation. Late constraints refine the existing answer instead of restarting the pipeline.
@@ -308,8 +310,12 @@ Canonical models (Pydantic in `app/models/`, IDs are ULIDs unless noted). Two fi
 ### 7.1 Document
 `doc_id` (PK) · `title` · `source_path` · `corpus_id` (str, indexed — **NEW**, resolution #8) · `ingested_at` (datetime) · `content_hash` · `section_count`.
 
+`doc_id` is **not** a ULID (post-freeze correction, see §0): it is the document's path relative to its corpus directory, extension removed, characters outside `[A-Za-z0-9._/-]` replaced by `_` — deterministic across re-ingestion and readable in `[doc_id §section]` citation tags (HC-3).
+
 ### 7.2 Chunk
 `chunk_id` (PK) · `doc_id` (FK) · `section` · `text` · `token_count` · `chunk_index` · `bm25_tokens`.
+
+`chunk_id` is **not** a ULID (post-freeze correction, see §0): it is a UUIDv5 over `(corpus_id, doc_id, section, chunk_index, sha256(text))` — deterministic, so an unchanged corpus re-ingests to the identical chunk set (Definition of Done), and a valid Qdrant point id (§7.13 requires point id = `chunk_id`; Qdrant accepts only unsigned integers or UUIDs).
 
 ### 7.3 Embedding
 `chunk_id` (PK/FK) · `vector` (float[384]) · `model_name` · `created_at`. Qdrant point payload+vector; `chunk_id` mirrored in SQLite.

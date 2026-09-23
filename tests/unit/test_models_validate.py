@@ -3,6 +3,8 @@
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
+
 from app.core.embeddings import embedding_dimension
 from app.core.events import EventType, RetrievalTrigger, TelemetryEvent
 from app.models.answer_version import AnswerVersion
@@ -15,23 +17,24 @@ from app.models.evidence import Evidence
 from app.models.retrieval_event import RetrievalEvent, RetrievalMode
 from app.models.session_state import Claim, SessionState
 from app.models.sub_query import SubQuery
-from pydantic import ValidationError
 
 
 def test_document_requires_corpus_id():
     doc = Document(
+        doc_id=Document.make_doc_id("venues.md"),
         title="Venue Policies",
-        source_path="data/corpus/default/venues.md",
+        source_path="default/venues.md",
         corpus_id="default",
         ingested_at=datetime.now(UTC),
         content_hash="abc123",
         section_count=4,
     )
-    assert doc.doc_id
+    assert doc.doc_id == "venues"
     assert doc.corpus_id == "default"
 
     with pytest.raises(ValidationError):
         Document(
+            doc_id="x",
             title="Missing corpus_id",
             source_path="x",
             ingested_at=datetime.now(UTC),
@@ -41,15 +44,24 @@ def test_document_requires_corpus_id():
 
 
 def test_chunk_defaults_and_required_fields():
+    """chunk_id is deterministic (PRD_TRD.md §7.2) and must be a valid Qdrant point id (UUID)."""
+    text = "Cancellation within 48h is free."
+    chunk_id = Chunk.make_chunk_id("default", "doc_1", "§2", 1, text)
     chunk = Chunk(
-        doc_id="doc_1",
-        section="§2",
-        text="Cancellation within 48h is free.",
-        token_count=8,
-        chunk_index=1,
+        chunk_id=chunk_id, doc_id="doc_1", section="§2", text=text, token_count=8, chunk_index=1
     )
-    assert chunk.chunk_id
+    assert chunk.chunk_id == Chunk.make_chunk_id("default", "doc_1", "§2", 1, text)
     assert chunk.bm25_tokens == []
+
+    with pytest.raises(ValidationError):
+        Chunk(
+            chunk_id="01ULIDNOTUUID",
+            doc_id="d",
+            section="§1",
+            text="t",
+            token_count=1,
+            chunk_index=0,
+        )
 
 
 def test_embedding_dimension_enforced():

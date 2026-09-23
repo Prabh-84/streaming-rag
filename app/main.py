@@ -31,9 +31,9 @@ log = structlog.get_logger()
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     log.info("startup", embedding_model=settings.embedding_model, qdrant_url=settings.qdrant_url)
-    # Phase 2 will replace this with a real corpus-ingestion call (scripts/ingest_corpus.py) run
-    # as part of this same startup event, per REQ-DEPLOY-01 (async ingestion, never blocking the
-    # port bind). No ingestion pipeline exists yet in this Phase 1 foundation.
+    # Phase 10 (PRD_TRD.md §10) wires scripts/ingest_corpus.py's ingest_corpus() into this startup
+    # event as a background task, per REQ-DEPLOY-01 (async ingestion, never blocking the port
+    # bind), and sets this flag from its outcome. Until then ingestion runs via the CLI.
     app.state.ingestion_complete = True
     yield
     log.info("shutdown")

@@ -7,7 +7,7 @@ or path inline — see PRD_TRD.md §9.8 (original TRD) design principle, carried
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     corpus_root: str = Field(default="data/corpus", alias="CORPUS_ROOT")
     processed_dir: str = Field(default="data/processed", alias="PROCESSED_DIR")
     default_corpus_id: str = Field(default="default", alias="DEFAULT_CORPUS_ID")
+
+    # --- Ingestion chunking (scripts/ingest_corpus.py) ---
+    chunk_max_tokens: int = Field(default=200, gt=0, alias="CHUNK_MAX_TOKENS")
+    chunk_overlap_tokens: int = Field(default=40, ge=0, alias="CHUNK_OVERLAP_TOKENS")
+
+    # --- Embedding call policy (original TRD §9.4: 500ms timeout, 1 retry, 200ms backoff) ---
+    embedding_timeout_ms: int = Field(default=500, gt=0, alias="EMBEDDING_TIMEOUT_MS")
+    embedding_retry_backoff_ms: int = Field(default=200, ge=0, alias="EMBEDDING_RETRY_BACKOFF_MS")
 
     # --- Retrieval Controller (REQ-CTRL-01/02/03) ---
     stability_threshold: float = Field(default=0.90, alias="STABILITY_THRESHOLD")
@@ -63,6 +71,12 @@ class Settings(BaseSettings):
 
     # --- Session lifecycle (REQ-SEC-01/02) ---
     session_ttl_seconds: int = Field(default=1800, alias="SESSION_TTL_SECONDS")
+
+    @model_validator(mode="after")
+    def _check_chunking(self) -> "Settings":
+        if self.chunk_overlap_tokens >= self.chunk_max_tokens:
+            raise ValueError("CHUNK_OVERLAP_TOKENS must be smaller than CHUNK_MAX_TOKENS")
+        return self
 
 
 @lru_cache

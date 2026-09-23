@@ -1,7 +1,8 @@
 """REQ-DEPLOY-01: /health is always 200; /ready gates on live Qdrant connectivity."""
 
-from app.main import create_app
 from fastapi.testclient import TestClient
+
+from app.main import create_app
 
 
 def test_health_always_200():

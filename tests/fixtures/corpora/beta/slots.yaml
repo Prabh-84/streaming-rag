@@ -1,0 +1,9 @@
+corpus_id: beta
+description: SYNTHETIC TEST FIXTURE (fictional travel policy). Not production data.
+slots:
+  - name: trip_type
+    patterns: ["domestic", "international"]
+    value_type: categorical
+  - name: currency
+    patterns: ["USD", "EUR", "INR"]
+    value_type: categorical
