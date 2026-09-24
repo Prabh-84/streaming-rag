@@ -1,0 +1,16 @@
+corpus_id: benchmark_v1
+description: SYNTHETIC BENCHMARK FIXTURE (fictional venues). Held-out replay corpus for Phase 9 evaluation only - not production data.
+slots:
+  - name: venue
+    patterns: ["Solstice Center", "Harbor Point"]
+    value_type: categorical
+    is_entity_key: true
+  - name: capacity
+    patterns: ["guests", "people", "seats"]
+    value_type: numeric
+  - name: cancellation_policy
+    patterns: ["cancellation policy", "cancellation"]
+    value_type: categorical
+  - name: catering
+    patterns: ["catering options", "catering"]
+    value_type: categorical

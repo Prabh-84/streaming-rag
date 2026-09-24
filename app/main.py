@@ -16,6 +16,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from app.api import evaluate as evaluate_router
 from app.api import events as events_router
 from app.api import session as session_router
 from app.api import stream as stream_router
@@ -86,6 +87,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await event_logger.start()
     app.state.event_logger = event_logger
 
+    # Phase 9 (REQ-EVAL-01): in-memory registry for POST/GET /evaluate - runs are process-lifetime
+    # only, same as every other piece of app.state here (REQ-SEC-01's "ephemeral store only").
+    app.state.evaluation_runs = {}
+    app.state.evaluation_tasks = set()
+
     # Composition root for Phase 3: one shared retriever + session store per process. Construction
     # is cheap (no I/O until first use) and reuses the already-warmed embedder singleton.
     app.state.session_store = SessionStore(settings, sink=event_logger.sink)
@@ -121,6 +127,7 @@ def create_app() -> FastAPI:
     app.include_router(session_router.router)
     app.include_router(stream_router.router)
     app.include_router(events_router.router)
+    app.include_router(evaluate_router.router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

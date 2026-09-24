@@ -1,0 +1,150 @@
+{
+  "corpus_id": "benchmark_v1",
+  "scenarios": [
+    {
+      "id": "BENCH-01",
+      "description": "Simple single-intent: one clear, single-topic question.",
+      "chunks": [
+        {"seq": 0, "text_delta": "I am organizing a small workshop and I need to know the cancellation policy", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": "I am organizing a small workshop and I need to know the cancellation policy at Solstice Center", "t_offset_ms": 500, "is_final": true}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "RETRIEVE"],
+        "max_sub_queries": 1,
+        "gold_relevant_chunk_ids": ["abe60b9a-a8e0-5b0b-b690-5169c5d21382"],
+        "expect_citation": true,
+        "utterance_end_offset_ms": 500
+      }
+    },
+    {
+      "id": "BENCH-02",
+      "description": "Compound multi-intent: >=3 distinct sub-questions in one utterance.",
+      "chunks": [
+        {"seq": 0, "text_delta": "I am planning a corporate event next month and I need to book a venue that can comfortably fit everyone and I have several detailed questions before I can confirm", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": "I am planning a corporate event next month and I need to book a venue that can comfortably fit everyone and I have several detailed questions before I can confirm, the cancellation policy and the catering options for Solstice Center", "t_offset_ms": 500, "is_final": true}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "RETRIEVE"],
+        "min_sub_queries": 2,
+        "gold_sub_intent_count": 2,
+        "gold_relevant_chunk_ids": ["abe60b9a-a8e0-5b0b-b690-5169c5d21382", "e5b7f622-8878-5176-ba2c-ce07b55249bb"],
+        "utterance_end_offset_ms": 500
+      }
+    },
+    {
+      "id": "BENCH-03",
+      "description": "Incomplete streaming: chunks arrive with realistic gaps and out-of-order delivery; buffer integrity must be preserved.",
+      "chunks": [
+        {"seq": 0, "text_delta": "Testing buffer integrity with Solstice Center", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": " with about two hundred attendees", "t_offset_ms": 500, "is_final": false},
+        {"seq": 2, "text_delta": " for the upcoming conference event", "t_offset_ms": 1000, "is_final": false}
+      ],
+      "send_order": [0, 2, 1],
+      "gold": {
+        "no_sequence_gap": true,
+        "final_buffer_text": "Testing buffer integrity with Solstice Center with about two hundred attendees for the upcoming conference event"
+      }
+    },
+    {
+      "id": "BENCH-04",
+      "description": "Early-retrieval-beneficial: a stable entity appears mid-utterance, before the transcript is final.",
+      "chunks": [
+        {"seq": 0, "text_delta": "I definitely want to book Solstice Center for our annual conference", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": "I definitely want to book Solstice Center for our annual conference for about 150 guests", "t_offset_ms": 500, "is_final": false}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "RETRIEVE"],
+        "retrieve_trigger": "provisional",
+        "eligible_for_early_retrieval": true,
+        "utterance_end_offset_ms": 2000
+      }
+    },
+    {
+      "id": "BENCH-05",
+      "description": "Premature-retrieval-risk: an ambiguous opener with no actionable entity for several chunks.",
+      "chunks": [
+        {"seq": 0, "text_delta": "So I was thinking about", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": " maybe doing something", "t_offset_ms": 500, "is_final": false},
+        {"seq": 2, "text_delta": " next month or so", "t_offset_ms": 1000, "is_final": false}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "WAIT", "WAIT"],
+        "eligible_for_early_retrieval": false
+      }
+    },
+    {
+      "id": "BENCH-06",
+      "description": "Late-arriving constraint: an initial answer exists, then a contrastive constraint arrives.",
+      "chunks": [
+        {"seq": 0, "text_delta": "I need to know more about Solstice Center for my upcoming event booking", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": "I need to know more about Solstice Center for my upcoming event booking for 150 guests", "t_offset_ms": 500, "is_final": false},
+        {"seq": 2, "text_delta": "Actually, could you also tell me the cancellation policy", "t_offset_ms": 1000, "is_final": false}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "RETRIEVE", "RETRIEVE"],
+        "second_retrieve_trigger": "delta",
+        "second_retrieve_reason": "refinement",
+        "gold_relevant_chunk_ids": ["abe60b9a-a8e0-5b0b-b690-5169c5d21382"]
+      }
+    },
+    {
+      "id": "BENCH-07",
+      "description": "No-retrieval formatting: a reformat/repeat request after a prior answer exists.",
+      "chunks": [
+        {"seq": 0, "text_delta": "I need to know the capacity of Solstice Center", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": "I need to know the capacity of Solstice Center for about 150 guests", "t_offset_ms": 500, "is_final": false},
+        {"seq": 2, "text_delta": "Can you summarize that in bullet points please", "t_offset_ms": 1500, "is_final": false}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "RETRIEVE", "NO_RETRIEVAL"],
+        "third_decision_reason": "presentation_only",
+        "gold_relevant_chunk_ids": ["842bb76b-d13f-5a33-bf22-eba84de1e6c4"]
+      }
+    },
+    {
+      "id": "BENCH-08",
+      "description": "Insufficient evidence: a question outside the corpus's coverage.",
+      "chunks": [
+        {"seq": 0, "text_delta": "Does Solstice Center have a policy on service animals or pets during events", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": "Does Solstice Center have a policy on service animals or pets during events for about 150 guests", "t_offset_ms": 500, "is_final": true}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "RETRIEVE"],
+        "expect_uncertainty": true,
+        "gold_relevant_chunk_ids": [],
+        "utterance_end_offset_ms": 500
+      }
+    },
+    {
+      "id": "BENCH-09",
+      "description": "Conflicting evidence: the corpus has two chunks with differing numeric values for the same venue's capacity.",
+      "chunks": [
+        {"seq": 0, "text_delta": "I need to know about Solstice Center for my event. ", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": "I need to know about Solstice Center for my event. I am planning for about 200 people.", "t_offset_ms": 500, "is_final": false},
+        {"seq": 2, "text_delta": "Actually, what is the exact capacity. For 260 guests would that fit.", "t_offset_ms": 1000, "is_final": false}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "RETRIEVE", "RETRIEVE"],
+        "second_retrieve_trigger": "delta",
+        "gold_relevant_chunk_ids": [
+          "842bb76b-d13f-5a33-bf22-eba84de1e6c4",
+          "b48c4b2f-942c-5929-ae1b-0bf1235b76b0"
+        ],
+        "expect_contradiction_pair": ["842bb76b-d13f-5a33-bf22-eba84de1e6c4", "b48c4b2f-942c-5929-ae1b-0bf1235b76b0"]
+      }
+    },
+    {
+      "id": "BENCH-10",
+      "description": "Citation validation (injected fault): the generator drafts a citation tag naming a chunk_id not in the evidence set.",
+      "chunks": [
+        {"seq": 0, "text_delta": "I am organizing a small workshop and I need to know the cancellation policy", "t_offset_ms": 0, "is_final": false},
+        {"seq": 1, "text_delta": "I am organizing a small workshop and I need to know the cancellation policy at Solstice Center", "t_offset_ms": 500, "is_final": true}
+      ],
+      "gold": {
+        "decisions": ["WAIT", "RETRIEVE"],
+        "injected_fabricated_citation": "[nonexistent_doc §99]",
+        "expect_zero_fabricated_citations": true
+      }
+    }
+  ]
+}
