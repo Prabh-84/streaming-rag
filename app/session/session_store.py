@@ -3,10 +3,11 @@ rolling controller/streaming state pseudocode 12.A calls `session.*`.
 
 Scope note: session isolation (REQ-SESS-03), corpus_id immutability (REQ-CORPUS-02), and the
 Retrieval Controller's rolling state (embedding_history, entities, wait_count,
-has_retrieved_for_topic, topic_embedding, last_evidence) needed to run the WebSocket stream and
-Phase 6 session refinement. `answer_versions`/claim-ledger population and the SQLite
-crash-recovery mirror depend on Synthesis and Grounding (later phases) and are not implemented
-here — `answer_versions` stays empty for the lifetime of a session until then.
+has_retrieved_for_topic, topic_embedding, last_evidence, answer_versions) needed to run the
+WebSocket stream, Phase 6 session refinement, and Phase 7 grounded generation. A full
+claim-lifecycle ledger (REQ-SESS-02's contradiction/supersession/carry-forward bookkeeping) and
+the SQLite crash-recovery mirror are not implemented here — see app.generation.streaming_generator
+for the current, more limited claim tracking (AnswerVersion.new_claim_ids only).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from app.core.config import Settings, get_settings
 from app.core.events import TelemetryEvent
 from app.core.slots import validate_corpus_id
 from app.models import new_id
+from app.models.answer_version import AnswerVersion
 from app.models.evidence import Evidence
 from app.models.transcript_chunk import TranscriptChunk
 
@@ -60,9 +62,10 @@ class SessionRecord:
         self.topic_embedding: tuple[float, ...] | None = None
         self.last_evidence: list[Evidence] = []
 
-        # Synthesis state — always empty in this phase (Phase 6 populates it); present now only
-        # so the first-turn suppression guard (REQ-SUPPRESS-02) has something real to check.
-        self.answer_versions: list[str] = []
+        # Phase 7 grounded generation (pseudocode 12.I): committed answer versions, in order.
+        # check_suppression's first-turn guard (REQ-SUPPRESS-02) also reads this list's
+        # truthiness — unaffected by what element type it holds.
+        self.answer_versions: list[AnswerVersion] = []
 
         # Ordered, gap-resolved transcript buffer (REQ-STREAM-01).
         self.buffer: list[TranscriptChunk] = []

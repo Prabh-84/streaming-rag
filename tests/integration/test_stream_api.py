@@ -11,11 +11,18 @@ from starlette.websockets import WebSocketDisconnect
 
 import app.controller.retrieval_controller as retrieval_controller
 import app.decomposition.multi_intent as multi_intent
+import app.generation.streaming_generator as streaming_generator
 from app.controller.entity_extraction import get_corpus_matcher
 from app.core.config import get_settings
 from app.core.slots import get_slot_schema
 from scripts.ingest_corpus import ingest_corpus
-from tests.fakes import FIXTURE_CORPORA, FakeDecomposer, FakeEmbedder, FakeReranker
+from tests.fakes import (
+    FIXTURE_CORPORA,
+    FakeDecomposer,
+    FakeEmbedder,
+    FakeGenerationLLM,
+    FakeReranker,
+)
 
 API_KEY = "change_me_local_dev"
 
@@ -49,6 +56,10 @@ async def app_client(tmp_path, monkeypatch):
     # cross-encoder model just because retrieval against the real ingested corpus returns
     # non-empty results.
     monkeypatch.setattr(retrieval_controller, "get_reranker", lambda: FakeReranker())
+    # Same reasoning for generation (Phase 7): an empty-stream FakeGenerationLLM produces no
+    # sentences, so stream_answer() returns None and emits nothing - existing tests' event counts
+    # are unaffected unless a test explicitly wants to exercise generation.
+    monkeypatch.setattr(streaming_generator, "get_generator", lambda: FakeGenerationLLM())
 
     app = main_module.create_app()
     with TestClient(app) as client:
@@ -198,6 +209,55 @@ def test_ws_streaming_produces_wait_then_retrieve(app_client):
 
         send_chunk(ws, 1, BASE_UTTERANCE + ", for 30 guests", 500)
         receive_retrieve_turn(ws)
+
+
+def test_ws_grounded_answer_streams_citations_and_answer_version(app_client, monkeypatch):
+    """Phase 7 end to end over the real WebSocket path: a RETRIEVE turn against the real ingested
+    alpha corpus produces a cited sentence, CITATION_CREATED and ANSWER_DELTA events, and a final
+    ANSWER_VERSION_CREATED — using the real Cancellation Policy content, never a benchmark string.
+    orion_hall.md's third heading ("Cancellation Policy") is real section label "§3" (scripts/
+    ingest_corpus.py's split_sections numbers headings in document order, 1-based) — verified
+    directly against split_sections() output, not assumed from the heading text."""
+    monkeypatch.setattr(
+        streaming_generator,
+        "get_generator",
+        lambda: FakeGenerationLLM(
+            chunks=[
+                "A booking at Orion Hall can be cancelled free of charge up to 14 days before the "
+                "event [orion_hall §3]."
+            ]
+        ),
+    )
+    session_id = create_session(app_client)["session_id"]
+    base = "I need to know more about Orion Hall for my upcoming event booking"
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, base, 0)
+        decision = ws.receive_json()
+        assert decision["payload"]["decision"] == "WAIT"  # first turn: no generation triggered
+
+        # High word overlap with chunk 0 keeps stability high (real bge-small model, same
+        # reasoning as test_ws_streaming_produces_wait_then_retrieve) while the appended clause
+        # supplies the cancellation_policy entity; verified empirically to also clear
+        # MIN_RELEVANCE under FakeReranker's word-overlap scoring for the Cancellation Policy
+        # chunk specifically, which the fake generator's scripted citation targets.
+        send_chunk(ws, 1, base + ", the cancellation policy", 500)
+        receive_retrieve_turn(ws)
+
+        citation = ws.receive_json()
+        assert citation["event_type"] == "CITATION_CREATED"
+        assert citation["payload"]["doc_id"] == "orion_hall"
+        assert citation["payload"]["section"] == "§3"
+
+        answer_delta = ws.receive_json()
+        assert answer_delta["event_type"] == "ANSWER_DELTA"
+        assert answer_delta["payload"]["is_final_sentence"] is True
+        assert "[orion_hall §3]" in answer_delta["payload"]["text_delta"]
+
+        answer_version = ws.receive_json()
+        assert answer_version["event_type"] == "ANSWER_VERSION_CREATED"
+        assert answer_version["payload"]["version_no"] == 1
+        assert answer_version["payload"]["supersedes"] is None
+        assert len(answer_version["payload"]["citations"]) == 1
 
 
 def test_compound_ws_request_produces_multiple_subqueries(app_client, monkeypatch):

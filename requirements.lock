@@ -10,7 +10,12 @@ python-dotenv==1.0.1
 websockets==13.1
 
 # --- LLM / embeddings / NLP ---
-anthropic==0.34.2
+# anthropic 1.8.0, not 0.34.2: the 0.34.x client construction crashes outright
+# (TypeError: unexpected keyword 'proxies') against httpx>=0.28, which google-genai requires;
+# 1.x vendors its own httpx fork specifically to avoid this class of conflict. The Messages API
+# surface AnthropicDecomposer/AnthropicGenerator use (model, max_tokens, messages, system, tools,
+# tool_choice, streaming) is unchanged between versions.
+anthropic==1.8.0
 google-genai==2.25.0
 sentence-transformers==3.1.1
 spacy==3.7.6

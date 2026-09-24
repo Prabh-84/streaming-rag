@@ -141,6 +141,36 @@ class FakeReranker:
         return [self._score_fn(query, text) for query, text in pairs]
 
 
+class FakeGenerationLLM:
+    """Test double for app.generation.streaming_generator.GenerationLLM. Never touches the
+    network. `chunks` is the sequence of streamed text pieces `.stream()` yields in order;
+    `complete_response` is what `.complete()` (the regeneration path) returns."""
+
+    def __init__(
+        self,
+        chunks: list[str] | None = None,
+        *,
+        complete_response: str = "",
+        raise_error: bool = False,
+    ) -> None:
+        self.stream_calls: list[tuple[str, str]] = []
+        self.complete_calls: list[tuple[str, str]] = []
+        self._chunks = chunks if chunks is not None else []
+        self._complete_response = complete_response
+        self._raise_error = raise_error
+
+    async def stream(self, system: str, prompt: str):
+        self.stream_calls.append((system, prompt))
+        if self._raise_error:
+            raise RuntimeError("injected generation failure")
+        for chunk in self._chunks:
+            yield chunk
+
+    async def complete(self, system: str, prompt: str) -> str:
+        self.complete_calls.append((system, prompt))
+        return self._complete_response
+
+
 class RecordingSink:
     def __init__(self) -> None:
         self.events: list[TelemetryEvent] = []

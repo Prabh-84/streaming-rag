@@ -70,6 +70,9 @@ class ControllerDecision:
     sub_query_ids: list[str] = field(default_factory=list)
     retrievals: list[RetrievalResult] = field(default_factory=list)
     evidence: list[Evidence] = field(default_factory=list)
+    # The SubQuery objects themselves (not just their ids) - Phase 7's Synthesis stage needs each
+    # sub-query's question text to build the generation prompt.
+    sub_queries: list[SubQuery] = field(default_factory=list)
 
 
 def _cosine(a: tuple[float, ...], b: tuple[float, ...]) -> float:
@@ -253,6 +256,7 @@ async def _retrieve(
         sub_query_ids=[sq.sub_query_id for sq in sub_queries],
         retrievals=results,
         evidence=evidence,
+        sub_queries=sub_queries,
     )
 
 
@@ -317,6 +321,7 @@ async def _refine(
         sub_query_ids=[sq.sub_query_id for sq in sub_queries],
         retrievals=results,
         evidence=evidence,
+        sub_queries=sub_queries,
     )
 
 

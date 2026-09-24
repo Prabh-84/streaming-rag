@@ -75,8 +75,11 @@ class Settings(BaseSettings):
     retrieval_timeout_ms: int = Field(default=800, alias="RETRIEVAL_TIMEOUT_MS")
     rrf_k: int = Field(default=60, alias="RRF_K")
 
-    # --- Grounding (REQ-GROUND-01/02/03) ---
+    # --- Grounding / Streaming Answer Generation (REQ-GROUND-01/02/03, pseudocode 12.F/12.I) ---
     entailment_min: float = Field(default=0.30, alias="ENTAILMENT_MIN")
+    # 15s: like DECOMPOSE_TIMEOUT_MS, above Gemini's own 10s minimum request deadline, with
+    # headroom for a full streamed answer (more output tokens than a single JSON decomposition).
+    generation_timeout_ms: int = Field(default=15_000, gt=0, alias="GENERATION_TIMEOUT_MS")
 
     # --- Session refinement (REQ-SESS-01/02) ---
     refinement_threshold: float = Field(default=0.75, alias="REFINEMENT_THRESHOLD")
