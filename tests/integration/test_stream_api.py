@@ -9,12 +9,13 @@ from fastapi.testclient import TestClient
 from qdrant_client import AsyncQdrantClient
 from starlette.websockets import WebSocketDisconnect
 
+import app.controller.retrieval_controller as retrieval_controller
 import app.decomposition.multi_intent as multi_intent
 from app.controller.entity_extraction import get_corpus_matcher
 from app.core.config import get_settings
 from app.core.slots import get_slot_schema
 from scripts.ingest_corpus import ingest_corpus
-from tests.fakes import FIXTURE_CORPORA, FakeDecomposer, FakeEmbedder
+from tests.fakes import FIXTURE_CORPORA, FakeDecomposer, FakeEmbedder, FakeReranker
 
 API_KEY = "change_me_local_dev"
 
@@ -44,6 +45,10 @@ async def app_client(tmp_path, monkeypatch):
     # back to one sub-query rather than ever reaching a real Anthropic call. Individual tests
     # that want genuine decomposition re-patch this within their own scope.
     monkeypatch.setattr(multi_intent, "get_decomposer", lambda: FakeDecomposer(sub_queries=None))
+    # Same reasoning for reranking (Phase 5): never let a WS integration test load the real
+    # cross-encoder model just because retrieval against the real ingested corpus returns
+    # non-empty results.
+    monkeypatch.setattr(retrieval_controller, "get_reranker", lambda: FakeReranker())
 
     app = main_module.create_app()
     with TestClient(app) as client:
@@ -85,18 +90,24 @@ def receive_n(ws, count: int) -> list[dict]:
 def receive_retrieve_turn(ws, *, expected_sub_queries: int = 1) -> list[dict]:
     """One RETRIEVE turn emits, in this fixed order: RETRIEVAL_DECISION (emitted before
     decomposition), one SUBQUERY_CREATED per sub-query (Phase 4 — exactly 1 for a non-compound
-    request), then RETRIEVAL_STARTED/RETRIEVAL_COMPLETED per sub-query per mode (dense+sparse,
-    Phase 2 HybridRetriever telemetry)."""
-    events = receive_n(ws, 1 + expected_sub_queries + 4 * expected_sub_queries)
+    request), RETRIEVAL_STARTED/RETRIEVAL_COMPLETED per sub-query per mode (dense+sparse, Phase 2
+    HybridRetriever telemetry), then one RERANK_COMPLETED per sub-query (Phase 5, emitted only
+    after every sub-query's retrieval has finished — fusion needs the whole turn's results)."""
+    total = 1 + expected_sub_queries + 4 * expected_sub_queries + expected_sub_queries
+    events = receive_n(ws, total)
     assert events[0]["event_type"] == "RETRIEVAL_DECISION"
     assert events[0]["payload"]["decision"] == "RETRIEVE"
     subquery_events = events[1 : 1 + expected_sub_queries]
     assert all(e["event_type"] == "SUBQUERY_CREATED" for e in subquery_events)
-    retrieval_types = [e["event_type"] for e in events[1 + expected_sub_queries :]]
+    retrieval_events = events[1 + expected_sub_queries : 1 + 5 * expected_sub_queries]
+    retrieval_types = [e["event_type"] for e in retrieval_events]
     assert sorted(retrieval_types) == sorted(
         ["RETRIEVAL_STARTED", "RETRIEVAL_STARTED", "RETRIEVAL_COMPLETED", "RETRIEVAL_COMPLETED"]
         * expected_sub_queries
     )
+    rerank_events = events[1 + 5 * expected_sub_queries :]
+    assert all(e["event_type"] == "RERANK_COMPLETED" for e in rerank_events)
+    assert len(rerank_events) == expected_sub_queries
     return events
 
 
@@ -282,7 +293,7 @@ def test_ws_trace_id_is_shared_within_one_chunk_but_differs_across_chunks(app_cl
         assert first["payload"]["decision"] == "WAIT"  # only 1 embedding so far, can't be stable
 
         send_chunk(ws, 1, BASE_UTTERANCE + ", for 30 guests", 500)
-        turn_2 = receive_retrieve_turn(ws)  # RETRIEVE -> one trace_id across all 5 of its events
+        turn_2 = receive_retrieve_turn(ws)  # RETRIEVE -> one trace_id across all 7 of its events
         assert len({e["trace_id"] for e in turn_2}) == 1
         assert turn_2[0]["trace_id"] != first["trace_id"]
 

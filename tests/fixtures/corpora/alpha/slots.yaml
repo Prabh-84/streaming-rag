@@ -4,6 +4,7 @@ slots:
   - name: venue
     patterns: ["Orion Hall", "Lumen Pavilion"]
     value_type: categorical
+    is_entity_key: true
   - name: capacity
     patterns: ["guests", "people", "seats"]
     value_type: numeric

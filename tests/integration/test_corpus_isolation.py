@@ -105,3 +105,21 @@ async def test_unknown_corpus_returns_no_evidence(two_corpora):
     result = await retriever.retrieve(req("gamma"))
     assert result.dense == [] and result.sparse == []
     assert result.sparse_error is not None  # no BM25 index: corpus was never ingested
+
+
+async def test_fusion_preserves_corpus_isolation(two_corpora):
+    """Phase 5 (REQ-EVID-02): fusing one corpus's retrieval results never contaminates the
+    resulting evidence pool with another corpus's chunks, even though both corpora share one
+    Qdrant collection and overlapping vocabulary."""
+    from app.retrieval.fusion import rrf_fuse
+
+    retriever, _, settings = two_corpora
+    alpha_ids = chunk_ids_of("alpha", settings.processed_dir)
+    beta_ids = chunk_ids_of("beta", settings.processed_dir)
+
+    alpha_result = await retriever.retrieve(req("alpha"))
+    evidence, chunks_by_id = rrf_fuse([alpha_result], rrf_k=60)
+    fused_ids = {e.chunk_id for e in evidence}
+    assert fused_ids and fused_ids <= alpha_ids
+    assert fused_ids.isdisjoint(beta_ids)
+    assert all(chunks_by_id[e.chunk_id].corpus_id == "alpha" for e in evidence)

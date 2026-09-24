@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from app.core.config import Settings
@@ -119,6 +119,26 @@ class FakeDecomposer:
         if self._sub_queries is None:
             return None
         return {"sub_queries": self._sub_queries}
+
+
+class FakeReranker:
+    """Test double for app.reranking.cross_encoder.Reranker. Never loads the real cross-encoder
+    model. Deterministic word-overlap score by default (query-token recall against the chunk
+    text); pass score_fn=(query, text) -> float for exact control over ordering/threshold tests."""
+
+    def __init__(self, score_fn: Callable[[str, str], float] | None = None) -> None:
+        self.calls: list[list[tuple[str, str]]] = []
+        self._score_fn = score_fn or self._word_overlap
+
+    @staticmethod
+    def _word_overlap(query: str, text: str) -> float:
+        q = set(tokenize(query))
+        t = set(tokenize(text))
+        return 0.0 if not q or not t else len(q & t) / len(q)
+
+    def score(self, pairs: list[tuple[str, str]]) -> list[float]:
+        self.calls.append(list(pairs))
+        return [self._score_fn(query, text) for query, text in pairs]
 
 
 class RecordingSink:

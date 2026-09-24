@@ -48,6 +48,11 @@ class Slot(BaseModel):
     name: str
     patterns: list[str]
     value_type: str = "text"
+    # Opt-in (REQ-EVID-04): identifies which slot names the "entity" a numeric slot's value is
+    # about, e.g. `venue`, so two chunks are only compared for contradiction when they're about
+    # the same entity. Corpora that don't declare one simply have no contradiction detection
+    # (a safe default, not a regression) — see SlotSchema.entity_key_slot().
+    is_entity_key: bool = False
 
     @field_validator("name")
     @classmethod
@@ -89,8 +94,20 @@ class SlotSchema(BaseModel):
             raise ValueError(f"duplicate slot names: {duplicates}")
         return self
 
+    @model_validator(mode="after")
+    def _check_single_entity_key(self) -> SlotSchema:
+        keys = [s.name for s in self.slots if s.is_entity_key]
+        if len(keys) > 1:
+            raise ValueError(f"at most one slot may set is_entity_key=true, got {keys}")
+        return self
+
     def slot_names(self) -> list[str]:
         return [s.name for s in self.slots]
+
+    def entity_key_slot(self) -> str | None:
+        """The slot name that identifies "which real-world thing" a chunk is about, if this
+        corpus declares one (REQ-EVID-04's "entity" half of an (entity, attribute) pair)."""
+        return next((s.name for s in self.slots if s.is_entity_key), None)
 
 
 class SlotSchemaError(ValueError):

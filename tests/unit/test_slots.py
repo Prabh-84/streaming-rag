@@ -127,3 +127,27 @@ def test_invalid_corpus_id_is_rejected(bad_id):
 def test_valid_corpus_ids_are_accepted():
     for good in ["default", "alpha", "hr-policy_v2", "A1"]:
         assert validate_corpus_id(good) == good
+
+
+# --- Phase 5: entity-key slot (REQ-EVID-04) ---------------------------------------------------
+
+
+def test_entity_key_slot_returns_declared_slot_name():
+    schema = load_slot_schema("alpha", FIXTURE_CORPORA)
+    assert schema.entity_key_slot() == "venue"
+
+
+def test_entity_key_slot_returns_none_when_undeclared():
+    schema = load_slot_schema("beta", FIXTURE_CORPORA)
+    assert schema.entity_key_slot() is None
+
+
+def test_multiple_entity_key_slots_rejected(tmp_path):
+    content = (
+        "slots:\n"
+        "  - name: venue\n    patterns: ['a']\n    is_entity_key: true\n"
+        "  - name: city\n    patterns: ['b']\n    is_entity_key: true\n"
+    )
+    root = _write(tmp_path, content)
+    with pytest.raises(SlotSchemaError, match="at most one slot may set is_entity_key"):
+        load_slot_schema("c1", root)

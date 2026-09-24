@@ -24,7 +24,14 @@ from app.retrieval.hybrid import HybridRetriever
 from app.retrieval.sparse_bm25 import SparseIndexRegistry
 from app.session.session_store import SessionStore
 from scripts.ingest_corpus import ingest_corpus
-from tests.fakes import FIXTURE_CORPORA, FakeDecomposer, FakeEmbedder, RecordingSink, make_settings
+from tests.fakes import (
+    FIXTURE_CORPORA,
+    FakeDecomposer,
+    FakeEmbedder,
+    FakeReranker,
+    RecordingSink,
+    make_settings,
+)
 
 COMPOUND_TEXT = "What is the cancellation policy and the catering options for Orion Hall"
 
@@ -85,6 +92,7 @@ async def run_chunk(
     embedder,
     settings,
     llm=None,
+    reranker=None,
     is_final=False,
     sink=None,
     seq=None,
@@ -99,6 +107,7 @@ async def run_chunk(
         retriever=retriever,
         embedder=embedder,
         llm=llm or FakeDecomposer(sub_queries=None),
+        reranker=reranker or FakeReranker(),
         settings=settings,
         sink=sink,
     )
@@ -424,9 +433,9 @@ async def test_telemetry_events_and_trace_id_propagation(
         sink=sink,
     )
     assert decision.decision == ctrl.RETRIEVE
-    # A RETRIEVE turn now emits its decision, then one SUBQUERY_CREATED per sub-query (Phase 4) —
-    # exactly one here, since this text carries no compound signal.
-    decision_event, subquery_event = sink.events
+    # A RETRIEVE turn emits: its decision, one SUBQUERY_CREATED per sub-query (Phase 4), then one
+    # RERANK_COMPLETED per sub-query (Phase 5) — exactly one of each here, non-compound text.
+    decision_event, subquery_event, rerank_event = sink.events
     assert decision_event.session_id == session.session_id
     assert decision_event.trace_id == "trc_1"
     assert decision_event.event_type == "RETRIEVAL_DECISION"
@@ -438,6 +447,12 @@ async def test_telemetry_events_and_trace_id_propagation(
     assert subquery_event.event_type == "SUBQUERY_CREATED"
     assert subquery_event.payload["text"] == "Orion Hall for 30 guests"
     assert subquery_event.payload["intent_label"] == "single"
+    assert rerank_event.event_type == "RERANK_COMPLETED"
+    assert rerank_event.payload["sub_query_id"] == subquery_event.payload["sub_query_id"]
+    # FakeRetriever (this test's retriever fixture) never returns real chunks, so there is
+    # nothing to rerank - an empty kept list is itself valid, expected telemetry.
+    assert rerank_event.payload["ranked_chunk_ids"] == []
+    assert rerank_event.payload["scores"] == []
 
 
 async def test_wait_telemetry_has_no_trigger(session, retriever, embedder, settings):
@@ -657,3 +672,44 @@ async def test_compound_request_end_to_end_with_real_hybrid_retriever(
     for result in decision.retrievals:
         assert result.corpus_id == "alpha"  # no cross-corpus leakage
         assert result.dense or result.sparse  # the real corpus actually has relevant content
+
+    # Phase 5: fusion + reranking over the real corpus's content produced real, capped evidence.
+    assert decision.evidence  # the real corpus has genuinely relevant content for both sub-intents
+    assert len(decision.evidence) <= real_settings.max_total_evidence
+    all_chunks = {c.chunk_id: c for r in decision.retrievals for c in (*r.dense, *r.sparse)}
+    for e in decision.evidence:
+        assert all_chunks[e.chunk_id].corpus_id == "alpha"  # corpus_id isolation preserved
+        assert e.duplicate_of is None  # only surviving, non-duplicate rows reach final evidence
+        assert e.rerank_score is not None and e.rerank_score >= real_settings.min_relevance
+
+
+async def test_multi_intent_evidence_fusion_mixes_both_subqueries_into_final_set(
+    real_alpha_retriever, monkeypatch
+):
+    """REQ-EVID-03's whole point: the final evidence set must genuinely represent every sub-intent
+    that had relevant content, not just whichever sub-query happened to score highest overall."""
+    real_retriever, real_settings, embedder = real_alpha_retriever
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+
+    store = SessionStore(real_settings)
+    session = await store.create("alpha")
+    llm = FakeDecomposer(
+        sub_queries=[
+            {"text": "cancellation policy for Orion Hall", "intent_label": "cancellation"},
+            {"text": "catering options for Orion Hall", "intent_label": "catering"},
+        ]
+    )
+
+    decision = await run_chunk(
+        session,
+        COMPOUND_TEXT,
+        0,
+        retriever=real_retriever,
+        embedder=embedder,
+        settings=real_settings,
+        llm=llm,
+    )
+
+    assert decision.decision == ctrl.RETRIEVE
+    represented_sub_queries = {e.sub_query_id for e in decision.evidence}
+    assert represented_sub_queries == set(decision.sub_query_ids)  # both sub-intents represented

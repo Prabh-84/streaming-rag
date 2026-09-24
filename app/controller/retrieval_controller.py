@@ -12,9 +12,13 @@ retrieval — a downstream refinement of an already-made decision, never a secon
 behavior-preserving extension of Phase 3: single-intent requests still issue exactly one retrieval
 call, just now routed through the decomposer's trivial fallback path.
 
-Out of scope for this phase (later phases): RRF/evidence fusion, cross-encoder reranking,
-session-answer refinement, grounding, answer generation. `check_suppression`'s ambiguous-match
-branch is deterministic-only here (no LLM call) — see app.controller.suppression.
+After all sub-queries are retrieved, their results are fused (RRF + dedup + contradiction
+flagging, REQ-EVID-02/04, retrieval/fusion.py), reranked per sub-query and capped globally
+(REQ-EVID-03, reranking/cross_encoder.py) into the final evidence set for the turn.
+
+Out of scope for this phase (later phases): session-answer refinement, grounding, answer
+generation. `check_suppression`'s ambiguous-match branch is deterministic-only here (no LLM
+call) — see app.controller.suppression.
 """
 
 from __future__ import annotations
@@ -29,8 +33,18 @@ from app.core.config import Settings, get_settings
 from app.core.embeddings import Embedder, get_embedder
 from app.core.events import EventSink, EventType, RetrievalTrigger, TelemetryEvent
 from app.decomposition.multi_intent import DecompositionLLM, decompose
+from app.models.evidence import Evidence
 from app.models.retrieval_event import RetrievalRequest, RetrievalResult
+from app.models.sub_query import SubQuery
 from app.models.transcript_chunk import TranscriptChunk
+from app.reranking.cross_encoder import (
+    Reranker,
+    cap_global_evidence,
+    get_reranker,
+    rerank_subquery,
+    truncate_to_token_budget,
+)
+from app.retrieval.fusion import dedup, flag_contradictions, rrf_fuse
 from app.retrieval.hybrid import HybridRetriever
 from app.session.session_store import SessionRecord
 
@@ -46,6 +60,7 @@ class ControllerDecision:
     trigger: RetrievalTrigger | None = None
     sub_query_ids: list[str] = field(default_factory=list)
     retrievals: list[RetrievalResult] = field(default_factory=list)
+    evidence: list[Evidence] = field(default_factory=list)
 
 
 def _cosine(a: tuple[float, ...], b: tuple[float, ...]) -> float:
@@ -75,6 +90,7 @@ async def on_chunk(
     retriever: HybridRetriever,
     embedder: Embedder | None = None,
     llm: DecompositionLLM | None = None,
+    reranker: Reranker | None = None,
     settings: Settings | None = None,
     sink: EventSink | None = None,
 ) -> ControllerDecision:
@@ -121,6 +137,8 @@ async def on_chunk(
                 sink,
                 RetrievalTrigger.FORCED_AFTER_MAX_WAIT,
                 llm=llm,
+                embedder=embedder,
+                reranker=reranker,
                 settings=settings,
             )
         return _decide(session, trace_id, sink, WAIT, "intent_unstable")
@@ -129,7 +147,16 @@ async def on_chunk(
     session.has_retrieved_for_topic = True
     trigger = RetrievalTrigger.FINAL if chunk.is_final else RetrievalTrigger.PROVISIONAL
     return await _retrieve(
-        session, chunk, trace_id, retriever, sink, trigger, llm=llm, settings=settings
+        session,
+        chunk,
+        trace_id,
+        retriever,
+        sink,
+        trigger,
+        llm=llm,
+        embedder=embedder,
+        reranker=reranker,
+        settings=settings,
     )
 
 
@@ -142,9 +169,13 @@ async def _retrieve(
     trigger: RetrievalTrigger,
     *,
     llm: DecompositionLLM | None = None,
+    embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
     settings: Settings | None = None,
 ) -> ControllerDecision:
     settings = settings or get_settings()
+    embedder = embedder or get_embedder()
+    reranker = reranker or get_reranker()
     _emit_event(session, trace_id, sink, RETRIEVE, trigger.value, trigger)
 
     sub_queries = await decompose(
@@ -154,6 +185,7 @@ async def _retrieve(
         chunk.t_offset_ms,
         trace_id=trace_id,
         llm=llm,
+        embedder=embedder,
         settings=settings,
         sink=sink,
     )
@@ -177,13 +209,63 @@ async def _retrieve(
         *(retriever.retrieve(request, sink=sink) for request in requests)
     )
 
+    evidence = await _fuse_and_rerank(
+        session, trace_id, sink, results, sub_queries, embedder, reranker, settings
+    )
+
     return ControllerDecision(
         decision=RETRIEVE,
         reason=trigger.value,
         trigger=trigger,
         sub_query_ids=[sq.sub_query_id for sq in sub_queries],
         retrievals=list(results),
+        evidence=evidence,
     )
+
+
+async def _fuse_and_rerank(
+    session: SessionRecord,
+    trace_id: str,
+    sink: EventSink | None,
+    results: list[RetrievalResult],
+    sub_queries: list[SubQuery],
+    embedder: Embedder,
+    reranker: Reranker,
+    settings: Settings,
+) -> list[Evidence]:
+    """Evidence Fusion + Reranking (pseudocode 12.D/12.E; REQ-EVID-02/03/04), run once per RETRIEVE
+    turn over every sub-query's results together — dedup and the global evidence cap are only
+    meaningful across the whole turn, not per sub-query."""
+    evidence, chunks_by_id = await asyncio.to_thread(rrf_fuse, results, settings.rrf_k)
+    evidence = await asyncio.to_thread(
+        dedup, evidence, chunks_by_id, settings.dedup_threshold, embedder
+    )
+    evidence = await asyncio.to_thread(
+        flag_contradictions, evidence, chunks_by_id, session.corpus_id
+    )
+
+    per_subquery_kept: dict[str, list[Evidence]] = {}
+    for sub_query in sub_queries:
+        candidates = [
+            e
+            for e in evidence
+            if e.sub_query_id == sub_query.sub_query_id and e.duplicate_of is None
+        ]
+        kept = await asyncio.to_thread(
+            rerank_subquery,
+            sub_query.text,
+            candidates,
+            chunks_by_id,
+            reranker,
+            min_relevance=settings.min_relevance,
+            final_k=settings.final_k,
+            rerank_candidates=settings.rerank_candidates,
+        )
+        per_subquery_kept[sub_query.sub_query_id] = kept
+        _emit_rerank_event(session, trace_id, sink, sub_query.sub_query_id, kept)
+
+    capped = cap_global_evidence(per_subquery_kept, settings.max_total_evidence)
+    return truncate_to_token_budget(capped, chunks_by_id, settings.evidence_token_budget)
 
 
 def _decide(
@@ -216,6 +298,29 @@ def _emit_event(
                 "decision": decision,
                 "trigger": trigger.value if trigger else None,
                 "reason": reason,
+            },
+        )
+    )
+
+
+def _emit_rerank_event(
+    session: SessionRecord,
+    trace_id: str,
+    sink: EventSink | None,
+    sub_query_id: str,
+    kept: list[Evidence],
+) -> None:
+    if sink is None:
+        return
+    sink(
+        TelemetryEvent(
+            session_id=session.session_id,
+            trace_id=trace_id,
+            event_type=EventType.RERANK_COMPLETED,
+            payload={
+                "sub_query_id": sub_query_id,
+                "ranked_chunk_ids": [e.chunk_id for e in kept],
+                "scores": [e.rerank_score for e in kept],
             },
         )
     )
