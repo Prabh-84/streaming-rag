@@ -9,11 +9,12 @@ from fastapi.testclient import TestClient
 from qdrant_client import AsyncQdrantClient
 from starlette.websockets import WebSocketDisconnect
 
+import app.decomposition.multi_intent as multi_intent
 from app.controller.entity_extraction import get_corpus_matcher
 from app.core.config import get_settings
 from app.core.slots import get_slot_schema
 from scripts.ingest_corpus import ingest_corpus
-from tests.fakes import FIXTURE_CORPORA, FakeEmbedder
+from tests.fakes import FIXTURE_CORPORA, FakeDecomposer, FakeEmbedder
 
 API_KEY = "change_me_local_dev"
 
@@ -39,6 +40,10 @@ async def app_client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main_module, "create_qdrant_client", lambda url: qdrant_client)
     monkeypatch.setattr(main_module, "get_embedder", lambda: embedder)
+    # Safe default: no usable sub-queries, so any incidentally-compound test text still falls
+    # back to one sub-query rather than ever reaching a real Anthropic call. Individual tests
+    # that want genuine decomposition re-patch this within their own scope.
+    monkeypatch.setattr(multi_intent, "get_decomposer", lambda: FakeDecomposer(sub_queries=None))
 
     app = main_module.create_app()
     with TestClient(app) as client:
@@ -77,20 +82,21 @@ def receive_n(ws, count: int) -> list[dict]:
     return [ws.receive_json() for _ in range(count)]
 
 
-def receive_retrieve_turn(ws) -> list[dict]:
-    """One RETRIEVE turn emits, in this fixed order: RETRIEVAL_DECISION (emitted before the
-    retriever call), then RETRIEVAL_STARTED x2 and RETRIEVAL_COMPLETED x2 (dense+sparse, from
-    the Phase 2 HybridRetriever's own telemetry)."""
-    events = receive_n(ws, 5)
+def receive_retrieve_turn(ws, *, expected_sub_queries: int = 1) -> list[dict]:
+    """One RETRIEVE turn emits, in this fixed order: RETRIEVAL_DECISION (emitted before
+    decomposition), one SUBQUERY_CREATED per sub-query (Phase 4 — exactly 1 for a non-compound
+    request), then RETRIEVAL_STARTED/RETRIEVAL_COMPLETED per sub-query per mode (dense+sparse,
+    Phase 2 HybridRetriever telemetry)."""
+    events = receive_n(ws, 1 + expected_sub_queries + 4 * expected_sub_queries)
     assert events[0]["event_type"] == "RETRIEVAL_DECISION"
     assert events[0]["payload"]["decision"] == "RETRIEVE"
-    types = [e["event_type"] for e in events[1:]]
-    assert sorted(types) == [
-        "RETRIEVAL_COMPLETED",
-        "RETRIEVAL_COMPLETED",
-        "RETRIEVAL_STARTED",
-        "RETRIEVAL_STARTED",
-    ]
+    subquery_events = events[1 : 1 + expected_sub_queries]
+    assert all(e["event_type"] == "SUBQUERY_CREATED" for e in subquery_events)
+    retrieval_types = [e["event_type"] for e in events[1 + expected_sub_queries :]]
+    assert sorted(retrieval_types) == sorted(
+        ["RETRIEVAL_STARTED", "RETRIEVAL_STARTED", "RETRIEVAL_COMPLETED", "RETRIEVAL_COMPLETED"]
+        * expected_sub_queries
+    )
     return events
 
 
@@ -181,6 +187,60 @@ def test_ws_streaming_produces_wait_then_retrieve(app_client):
 
         send_chunk(ws, 1, BASE_UTTERANCE + ", for 30 guests", 500)
         receive_retrieve_turn(ws)
+
+
+def test_compound_ws_request_produces_multiple_subqueries(app_client, monkeypatch):
+    """Phase 4 end to end over the real WebSocket path: a genuinely compound utterance decomposes
+    into 2 SUBQUERY_CREATED events and 2 concurrently-retrieved sub-queries, using the real corpus
+    content (alpha's Cancellation Policy / Catering sections) — never a benchmark string."""
+    monkeypatch.setattr(
+        multi_intent,
+        "get_decomposer",
+        lambda: FakeDecomposer(
+            sub_queries=[
+                {
+                    "text": "What is the cancellation policy for Orion Hall?",
+                    "intent_label": "cancellation",
+                },
+                {
+                    "text": "What are the catering options for Orion Hall?",
+                    "intent_label": "catering",
+                },
+            ]
+        ),
+    )
+    session_id = create_session(app_client)["session_id"]
+    base = (
+        "I am planning a corporate event next month and I need to book a venue that can "
+        "comfortably fit everyone and I have several detailed questions about the arrangements "
+        "before I can confirm the final booking with my team"
+    )
+    compound_clause = ", the cancellation policy and the catering options for Orion Hall"
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, base, 0)
+        decision = ws.receive_json()
+        assert decision["payload"]["decision"] == "WAIT"  # first chunk: no entity yet
+
+        # High word overlap with chunk 0 (same reasoning as test_ws_streaming_produces_wait_then_
+        # retrieve) keeps stability high while the appended clause supplies both new entities and
+        # the compound (cc/conj across two distinct slots) signal. This restates chunk 0's text in
+        # chunk 1's delta rather than sending only the incremental clause, which duplicates it in
+        # session.buffer_text() (the per-chunk stability embedding, keyed on text_delta alone,
+        # would otherwise see too little word overlap between chunks with the hash-based test
+        # embedder). Harmless here since the mocked decomposer returns fixed sub-query text rather
+        # than echoing the buffer; see the Phase 4 report for this as a pre-existing test-fixture
+        # characteristic inherited from Phase 3, not an application bug.
+        send_chunk(ws, 1, base + compound_clause, 500)
+        turn = receive_retrieve_turn(ws, expected_sub_queries=2)
+
+        subquery_events = [e for e in turn if e["event_type"] == "SUBQUERY_CREATED"]
+        assert {e["payload"]["intent_label"] for e in subquery_events} == {
+            "cancellation",
+            "catering",
+        }
+
+        started = [e for e in turn if e["event_type"] == "RETRIEVAL_STARTED"]
+        assert {e["payload"]["trigger"] for e in started} == {"provisional", "multi_intent"}
 
 
 def test_ws_no_retrieval_call_when_decision_is_wait_or_no_retrieval(app_client):

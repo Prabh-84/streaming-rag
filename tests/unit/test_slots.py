@@ -79,7 +79,8 @@ def _write(tmp_path: Path, content: str | bytes, corpus_id: str = "c1") -> Path:
 def test_slots_schema_loads():
     schema = load_slot_schema("alpha", FIXTURE_CORPORA)
     assert schema.corpus_id == "alpha"
-    assert schema.slot_names() == ["venue", "capacity"]
+    # capacity/cancellation_policy/catering (Phase 4) support compound-signal test fixtures.
+    assert schema.slot_names() == ["venue", "capacity", "cancellation_policy", "catering"]
     assert schema.slots[1].value_type == "numeric"
 
 

@@ -75,6 +75,17 @@ class CorpusMatcher:
                 entities[slot.name] = pattern  # canonical: the pattern, not the matched casing
         return entities
 
+    def raw_matches(self, doc: Doc) -> list[tuple[str, int, int]]:
+        """Every slot match with its token span, as (slot_name, start, end). Unlike extract()
+        (one value per slot, last-occurrence-wins), this keeps every occurrence and its position
+        — what the Multi-Intent Decomposer's compound-signal check needs to tell whether two
+        different mentions fall on two different sides of a conjunction (REQ-NLP-01/REQ-INTENT-01).
+        """
+        return [
+            (self._meta[match_id][0].name, start, end)
+            for match_id, start, end in self._matcher(doc)
+        ]
+
     @staticmethod
     def _numeric_value(doc: Doc, start: int, end: int) -> str | None:
         before = doc[max(0, start - _NUMERIC_LOOKAROUND) : start]

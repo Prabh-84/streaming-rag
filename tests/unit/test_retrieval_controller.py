@@ -7,6 +7,9 @@ server (per the Phase 3 brief).
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from app.controller import retrieval_controller as ctrl
@@ -16,8 +19,14 @@ from app.core.events import RetrievalTrigger
 from app.core.slots import get_slot_schema
 from app.models.retrieval_event import RetrievalResult
 from app.models.transcript_chunk import TranscriptChunk
+from app.retrieval.dense import DenseIndex
+from app.retrieval.hybrid import HybridRetriever
+from app.retrieval.sparse_bm25 import SparseIndexRegistry
 from app.session.session_store import SessionStore
-from tests.fakes import FIXTURE_CORPORA, FakeEmbedder, RecordingSink, make_settings
+from scripts.ingest_corpus import ingest_corpus
+from tests.fakes import FIXTURE_CORPORA, FakeDecomposer, FakeEmbedder, RecordingSink, make_settings
+
+COMPOUND_TEXT = "What is the cancellation policy and the catering options for Orion Hall"
 
 
 class FakeRetriever:
@@ -75,6 +84,7 @@ async def run_chunk(
     retriever,
     embedder,
     settings,
+    llm=None,
     is_final=False,
     sink=None,
     seq=None,
@@ -88,6 +98,7 @@ async def run_chunk(
         trace_id="trc_1",
         retriever=retriever,
         embedder=embedder,
+        llm=llm or FakeDecomposer(sub_queries=None),
         settings=settings,
         sink=sink,
     )
@@ -413,15 +424,20 @@ async def test_telemetry_events_and_trace_id_propagation(
         sink=sink,
     )
     assert decision.decision == ctrl.RETRIEVE
-    (event,) = sink.events
-    assert event.session_id == session.session_id
-    assert event.trace_id == "trc_1"
-    assert event.event_type == "RETRIEVAL_DECISION"
-    assert event.payload == {
+    # A RETRIEVE turn now emits its decision, then one SUBQUERY_CREATED per sub-query (Phase 4) —
+    # exactly one here, since this text carries no compound signal.
+    decision_event, subquery_event = sink.events
+    assert decision_event.session_id == session.session_id
+    assert decision_event.trace_id == "trc_1"
+    assert decision_event.event_type == "RETRIEVAL_DECISION"
+    assert decision_event.payload == {
         "decision": "RETRIEVE",
         "trigger": "provisional",
         "reason": "provisional",
     }
+    assert subquery_event.event_type == "SUBQUERY_CREATED"
+    assert subquery_event.payload["text"] == "Orion Hall for 30 guests"
+    assert subquery_event.payload["intent_label"] == "single"
 
 
 async def test_wait_telemetry_has_no_trigger(session, retriever, embedder, settings):
@@ -467,3 +483,177 @@ async def test_controller_deterministic_replay(settings):
     first = await replay()
     second = await replay()
     assert first == second
+
+
+# --- G. Retrieval integration (Phase 4: decomposition -> concurrent retrieval) ------------------
+
+
+async def test_compound_request_calls_retriever_once_per_subquery_with_correct_triggers(
+    session, retriever, embedder, settings, monkeypatch
+):
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    llm = FakeDecomposer(
+        sub_queries=[
+            {
+                "text": "What is the cancellation policy for Orion Hall?",
+                "intent_label": "cancellation",
+            },
+            {"text": "What are the catering options for Orion Hall?", "intent_label": "catering"},
+        ]
+    )
+    decision = await run_chunk(
+        session,
+        COMPOUND_TEXT,
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+        llm=llm,
+    )
+    assert decision.decision == ctrl.RETRIEVE
+    assert len(retriever.calls) == 2
+    assert len(decision.sub_query_ids) == 2
+    assert len(decision.retrievals) == 2
+
+    first, second = retriever.calls
+    assert first.text == "What is the cancellation policy for Orion Hall?"
+    assert first.trigger == RetrievalTrigger.PROVISIONAL  # keeps the controller-level trigger
+    assert second.text == "What are the catering options for Orion Hall?"
+    assert second.trigger == RetrievalTrigger.MULTI_INTENT  # REQ-OBS-05
+
+
+async def test_compound_request_preserves_corpus_id_for_every_subquery(
+    session, retriever, embedder, settings, monkeypatch
+):
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    llm = FakeDecomposer(
+        sub_queries=[
+            {"text": "cancellation policy for Orion Hall", "intent_label": "a"},
+            {"text": "catering options for Orion Hall", "intent_label": "b"},
+        ]
+    )
+    await run_chunk(
+        session,
+        COMPOUND_TEXT,
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+        llm=llm,
+    )
+    assert len(retriever.calls) == 2
+    assert all(request.corpus_id == "alpha" == session.corpus_id for request in retriever.calls)
+
+
+async def test_compound_request_subqueries_are_retrieved_concurrently(
+    session, embedder, settings, monkeypatch
+):
+    """Wall time for N sub-query retrievals must be ~one retrieval's latency, not the sum —
+    the controller dispatches them via asyncio.gather, exactly as it already did for dense+sparse
+    within a single sub-query (REQ-EVID-01)."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+
+    class SlowRetriever:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def retrieve(self, request, *, sink=None) -> RetrievalResult:
+            self.calls.append(request)
+            await asyncio.sleep(0.2)
+            return RetrievalResult(sub_query_id=request.sub_query_id, corpus_id=request.corpus_id)
+
+    retriever = SlowRetriever()
+    llm = FakeDecomposer(
+        sub_queries=[
+            {"text": "cancellation policy for Orion Hall", "intent_label": "a"},
+            {"text": "catering options for Orion Hall", "intent_label": "b"},
+        ]
+    )
+    started = time.perf_counter()
+    decision = await run_chunk(
+        session,
+        COMPOUND_TEXT,
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+        llm=llm,
+    )
+    elapsed = time.perf_counter() - started
+    assert decision.decision == ctrl.RETRIEVE
+    assert len(retriever.calls) == 2
+    assert elapsed < 0.35  # ~max(0.2, 0.2), not the 0.4 sum
+
+
+async def test_single_intent_request_still_calls_retriever_exactly_once(
+    session, retriever, embedder, settings, monkeypatch
+):
+    """Regression guard: a normal, non-compound request must retrieve exactly once, exactly as
+    it did before decomposition existed (Phase 3 behavior, now routed through the decomposer's
+    trivial single-subquery path)."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    decision = await run_chunk(
+        session,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+    assert decision.decision == ctrl.RETRIEVE
+    assert len(retriever.calls) == 1
+    assert retriever.calls[0].trigger == RetrievalTrigger.PROVISIONAL  # never multi_intent
+    assert len(decision.sub_query_ids) == 1
+
+
+@pytest.fixture
+async def real_alpha_retriever(tmp_path):
+    """The genuine Phase 2 HybridRetriever (real semaphore, real timeouts), over an in-memory
+    Qdrant + BM25 index built from the actual alpha fixture corpus via a FakeEmbedder — proves
+    Phase 4 dispatches into the *existing* retrieval primitive, not a reimplementation."""
+    from qdrant_client import AsyncQdrantClient
+
+    real_settings = make_settings(FIXTURE_CORPORA, tmp_path)
+    embedder = FakeEmbedder()
+    qdrant_client = AsyncQdrantClient(location=":memory:")
+    await ingest_corpus(
+        "alpha", settings=real_settings, embedder=embedder, qdrant_client=qdrant_client
+    )
+    dense = DenseIndex(qdrant_client, embedder, real_settings)
+    sparse = SparseIndexRegistry(real_settings)
+    yield HybridRetriever(dense, sparse, real_settings), real_settings, embedder
+    await qdrant_client.close()
+
+
+async def test_compound_request_end_to_end_with_real_hybrid_retriever(
+    real_alpha_retriever, monkeypatch
+):
+    """Section G, full stack: real corpus, real HybridRetriever (bounded concurrency + per-mode
+    timeouts unchanged from Phase 2/3), driven by a genuinely compound request."""
+    real_retriever, real_settings, embedder = real_alpha_retriever
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+
+    store = SessionStore(real_settings)
+    session = await store.create("alpha")
+    llm = FakeDecomposer(
+        sub_queries=[
+            {"text": "cancellation policy for Orion Hall", "intent_label": "cancellation"},
+            {"text": "catering options for Orion Hall", "intent_label": "catering"},
+        ]
+    )
+
+    decision = await run_chunk(
+        session,
+        COMPOUND_TEXT,
+        0,
+        retriever=real_retriever,
+        embedder=embedder,
+        settings=real_settings,
+        llm=llm,
+    )
+
+    assert decision.decision == ctrl.RETRIEVE
+    assert len(decision.retrievals) == 2
+    for result in decision.retrievals:
+        assert result.corpus_id == "alpha"  # no cross-corpus leakage
+        assert result.dense or result.sparse  # the real corpus actually has relevant content

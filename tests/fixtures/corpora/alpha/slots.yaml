@@ -7,3 +7,9 @@ slots:
   - name: capacity
     patterns: ["guests", "people", "seats"]
     value_type: numeric
+  - name: cancellation_policy
+    patterns: ["cancellation policy", "cancellation"]
+    value_type: categorical
+  - name: catering
+    patterns: ["catering options", "catering"]
+    value_type: categorical

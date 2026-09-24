@@ -52,8 +52,9 @@ class Settings(BaseSettings):
     max_wait_chunks: int = Field(default=6, alias="MAX_WAIT_CHUNKS")
     reorder_window_ms: int = Field(default=2000, ge=0, alias="REORDER_WINDOW_MS")
 
-    # --- Multi-Intent Decomposer (REQ-INTENT-01/02) ---
+    # --- Multi-Intent Decomposer (REQ-INTENT-01/02, pseudocode 12.B) ---
     merge_threshold: float = Field(default=0.85, alias="MERGE_THRESHOLD")
+    decompose_timeout_ms: int = Field(default=1500, gt=0, alias="DECOMPOSE_TIMEOUT_MS")
 
     # --- Evidence fusion / reranking (REQ-EVID-01..04) ---
     dedup_threshold: float = Field(default=0.95, alias="DEDUP_THRESHOLD")

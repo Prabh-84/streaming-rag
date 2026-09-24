@@ -6,6 +6,7 @@ production corpus location (data/corpus/).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 import time
@@ -91,6 +92,33 @@ class FakeEmbedder:
     def warmup(self) -> None:
         if self._delay_s:
             time.sleep(self._delay_s)
+
+
+class FakeDecomposer:
+    """Test double for app.decomposition.multi_intent.DecompositionLLM. Never touches the
+    network; controller/decomposition unit tests must not depend on a real Anthropic API key."""
+
+    def __init__(
+        self,
+        sub_queries: list[dict[str, str]] | None = None,
+        *,
+        raise_error: bool = False,
+        delay_s: float = 0.0,
+    ) -> None:
+        self.calls: list[str] = []
+        self._sub_queries = sub_queries
+        self._raise_error = raise_error
+        self._delay_s = delay_s
+
+    async def decompose(self, transcript: str, *, timeout_ms: int) -> dict[str, object] | None:
+        self.calls.append(transcript)
+        if self._delay_s:
+            await asyncio.sleep(self._delay_s)
+        if self._raise_error:
+            raise RuntimeError("injected decomposition failure")
+        if self._sub_queries is None:
+            return None
+        return {"sub_queries": self._sub_queries}
 
 
 class RecordingSink:
