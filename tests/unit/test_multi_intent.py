@@ -385,3 +385,148 @@ async def test_full_decomposition_end_to_end_produces_two_distinct_sub_queries(s
     assert len(sub_queries) == 2
     assert {sq.intent_label for sq in sub_queries} == {"cancellation", "catering"}
     assert llm.calls == [COMPOUND_TEXT]
+
+
+# --- G. Provider configuration (Gemini) -----------------------------------------------------------
+#
+# GeminiDecomposer talks to the real network only via google.genai.Client, so these tests fake
+# that one seam (Client.aio.models.generate_content) rather than mocking DecompositionLLM itself
+# — this is the only place the Gemini-specific request/response shape (response.text as a JSON
+# string, not an Anthropic-style tool_use block) is exercised. The real, unmocked network path is
+# covered separately by the live E2E smoke test (requires GEMINI_API_KEY; skipped otherwise).
+
+
+def _fake_genai_client_cls(response_text: str | None):
+    """A stand-in for google.genai.Client whose .aio.models.generate_content(...) returns an
+    object with a .text attribute, mirroring the real SDK's response shape."""
+    from types import SimpleNamespace
+
+    calls: list[dict] = []
+
+    class _FakeModels:
+        async def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text=response_text)
+
+    class _FakeClient:
+        calls_ref = calls
+
+        def __init__(self, api_key: str | None = None) -> None:
+            self.api_key = api_key
+            self.aio = SimpleNamespace(models=_FakeModels())
+
+    return _FakeClient
+
+
+async def test_gemini_decomposer_parses_valid_structured_json(monkeypatch):
+    from app.decomposition.multi_intent import GeminiDecomposer
+
+    fake_cls = _fake_genai_client_cls(
+        '{"sub_queries": [{"text": "a", "intent_label": "x"}, {"text": "b", "intent_label": "y"}]}'
+    )
+    monkeypatch.setattr("google.genai.Client", fake_cls)
+
+    llm = GeminiDecomposer(api_key="fake-key", model="gemini-3.6-flash")
+    result = await llm.decompose("some transcript", timeout_ms=15_000)
+
+    assert result == {
+        "sub_queries": [
+            {"text": "a", "intent_label": "x"},
+            {"text": "b", "intent_label": "y"},
+        ]
+    }
+    (call,) = fake_cls.calls_ref
+    assert call["model"] == "gemini-3.6-flash"
+    assert call["contents"] == "some transcript"
+    assert call["config"].http_options.timeout == 15_000  # already above Gemini's floor, unchanged
+
+
+async def test_gemini_decomposer_enforces_10s_request_deadline_floor(monkeypatch):
+    """Gemini's API hard-rejects (400 INVALID_ARGUMENT) any request deadline under 10s before
+    attempting generation at all — confirmed against the real API. A caller passing a smaller
+    timeout_ms (e.g. a test override, or a pre-fix DECOMPOSE_TIMEOUT_MS) must still not get every
+    real call rejected, so GeminiDecomposer clamps up to Gemini's own floor rather than passing
+    the caller's value straight through."""
+    from app.decomposition.multi_intent import GeminiDecomposer
+
+    fake_cls = _fake_genai_client_cls('{"sub_queries": [{"text": "a", "intent_label": "x"}]}')
+    monkeypatch.setattr("google.genai.Client", fake_cls)
+
+    llm = GeminiDecomposer(api_key="fake-key", model="gemini-3.6-flash")
+    await llm.decompose("some transcript", timeout_ms=1500)
+
+    (call,) = fake_cls.calls_ref
+    assert call["config"].http_options.timeout == 10_000
+
+
+async def test_gemini_decomposer_returns_none_on_invalid_json(monkeypatch):
+    from app.decomposition.multi_intent import GeminiDecomposer
+
+    monkeypatch.setattr("google.genai.Client", _fake_genai_client_cls("not valid json"))
+    llm = GeminiDecomposer(api_key="fake-key", model="gemini-3.6-flash")
+    assert await llm.decompose("x", timeout_ms=1500) is None
+
+
+async def test_gemini_decomposer_returns_none_on_empty_response(monkeypatch):
+    from app.decomposition.multi_intent import GeminiDecomposer
+
+    monkeypatch.setattr("google.genai.Client", _fake_genai_client_cls(None))
+    llm = GeminiDecomposer(api_key="fake-key", model="gemini-3.6-flash")
+    assert await llm.decompose("x", timeout_ms=1500) is None
+
+
+async def test_gemini_decomposer_output_flows_through_full_decompose_pipeline(
+    monkeypatch, settings
+):
+    """The Gemini path, exercised through the same decompose() orchestrator the Anthropic path
+    uses — proves the provider swap didn't change the compound-signal gate, validation, or
+    anti-fragmentation merge behavior downstream of the LLM call."""
+    from app.decomposition.multi_intent import GeminiDecomposer
+
+    fake_cls = _fake_genai_client_cls(
+        '{"sub_queries": ['
+        '{"text": "What is the cancellation policy for Orion Hall?", '
+        '"intent_label": "cancellation"}, '
+        '{"text": "What are the catering options for Orion Hall?", "intent_label": "catering"}'
+        "]}"
+    )
+    monkeypatch.setattr("google.genai.Client", fake_cls)
+    llm = GeminiDecomposer(api_key="fake-key", model="gemini-3.6-flash")
+
+    sub_queries = await decompose(
+        COMPOUND_TEXT, "alpha", "sess_1", 0, trace_id="trc_1", llm=llm, settings=settings
+    )
+    assert len(sub_queries) == 2
+    assert {sq.intent_label for sq in sub_queries} == {"cancellation", "catering"}
+
+
+def test_get_decomposer_dispatches_on_llm_provider(monkeypatch, tmp_path):
+    from app.decomposition import multi_intent
+    from app.decomposition.multi_intent import AnthropicDecomposer, GeminiDecomposer
+
+    anthropic_settings = make_settings(
+        FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="k", LLM_MODEL="m"
+    )
+    monkeypatch.setattr(multi_intent, "get_settings", lambda: anthropic_settings)
+    multi_intent.get_decomposer.cache_clear()
+    assert isinstance(multi_intent.get_decomposer(), AnthropicDecomposer)
+
+    gemini_settings = make_settings(
+        FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="gemini", GEMINI_API_KEY="k", GEMINI_MODEL="g"
+    )
+    monkeypatch.setattr(multi_intent, "get_settings", lambda: gemini_settings)
+    multi_intent.get_decomposer.cache_clear()
+    assert isinstance(multi_intent.get_decomposer(), GeminiDecomposer)
+
+    multi_intent.get_decomposer.cache_clear()  # never leak a cached instance into other tests
+
+
+def test_get_decomposer_rejects_unknown_provider(monkeypatch, tmp_path):
+    from app.decomposition import multi_intent
+
+    bad_settings = make_settings(FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="not_a_real_provider")
+    monkeypatch.setattr(multi_intent, "get_settings", lambda: bad_settings)
+    multi_intent.get_decomposer.cache_clear()
+    with pytest.raises(ValueError, match="not_a_real_provider"):
+        multi_intent.get_decomposer()
+    multi_intent.get_decomposer.cache_clear()

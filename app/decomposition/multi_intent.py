@@ -11,6 +11,12 @@ Every proposed sub-query is embedded and pairwise-compared against the ones alre
 pair whose cosine exceeds MERGE_THRESHOLD is merged into one, preventing pitfall 5
 (over-fragmentation). If the LLM call fails, times out, or returns nothing usable, the whole
 transcript is used as a single fallback sub-query rather than dropping the turn.
+
+The LLM behind structured decomposition is swappable via LLM_PROVIDER (anthropic | gemini,
+default anthropic) — both implementations satisfy the same DecompositionLLM protocol and must
+produce the identical {"sub_queries": [{"text", "intent_label"}, ...]} shape before it ever
+reaches _validate_proposed(); everything downstream of that call (validation, merge, fallback,
+retrieval) is provider-agnostic.
 """
 
 from __future__ import annotations
@@ -183,10 +189,69 @@ class AnthropicDecomposer:
         return None
 
 
+class GeminiDecomposer:
+    """Wraps the configured Gemini model behind DecompositionLLM, using Gemini's native
+    response_schema JSON mode (not tool-use, since Gemini's structured-output guarantee is
+    stronger there) to produce the same {"sub_queries": [...]} shape the Anthropic path emits.
+    Lazily constructs the SDK client on first use, same lazy-singleton pattern as
+    AnthropicDecomposer above."""
+
+    def __init__(self, api_key: str, model: str) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._client: Any = None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            from google import genai
+
+            self._client = genai.Client(api_key=self._api_key)
+        return self._client
+
+    async def decompose(self, transcript: str, *, timeout_ms: int) -> Any:
+        import json
+
+        from google.genai import types
+
+        client = self._get_client()
+        response = await client.aio.models.generate_content(
+            model=self._model,
+            contents=transcript,
+            config=types.GenerateContentConfig(
+                system_instruction=_DECOMPOSE_SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=_DECOMPOSE_TOOL_SCHEMA["input_schema"],
+                # Transport-level timeout as a second line of defense, same reasoning as
+                # AnthropicDecomposer.decompose(); decompose() below is the authoritative
+                # enforcement point. Gemini's API hard-rejects any request deadline under 10s
+                # (400 INVALID_ARGUMENT) before attempting generation at all, so this floor is
+                # required for the SDK call to even be well-formed — it does not change the
+                # project's own timeout budget, which asyncio.wait_for() in decompose() still
+                # enforces and can still cancel a slow call well before Gemini's floor elapses.
+                http_options=types.HttpOptions(timeout=max(timeout_ms, 10_000)),
+            ),
+        )
+        if not response.text:
+            return None
+        try:
+            return json.loads(response.text)
+        except json.JSONDecodeError:
+            return None
+
+
+_PROVIDERS = {"anthropic", "gemini"}
+
+
 @lru_cache(maxsize=1)
-def get_decomposer() -> AnthropicDecomposer:
+def get_decomposer() -> DecompositionLLM:
     settings = get_settings()
-    return AnthropicDecomposer(settings.anthropic_api_key, settings.llm_model)
+    if settings.llm_provider == "gemini":
+        return GeminiDecomposer(settings.gemini_api_key, settings.gemini_model)
+    if settings.llm_provider == "anthropic":
+        return AnthropicDecomposer(settings.anthropic_api_key, settings.llm_model)
+    raise ValueError(
+        f"Unknown LLM_PROVIDER {settings.llm_provider!r}; expected one of {sorted(_PROVIDERS)}"
+    )
 
 
 def _validate_proposed(raw: Any) -> list[ProposedSubQuery]:

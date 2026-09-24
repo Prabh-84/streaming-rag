@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     # --- Secrets / external services ---
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
     api_key: str = Field(default="change_me_local_dev", alias="API_KEY")
     eval_key: str = Field(default="change_me_eval", alias="EVAL_KEY")
 
@@ -27,7 +28,9 @@ class Settings(BaseSettings):
     reranker_model: str = Field(
         default="cross-encoder/ms-marco-MiniLM-L-6-v2", alias="RERANKER_MODEL"
     )
+    llm_provider: str = Field(default="anthropic", alias="LLM_PROVIDER")  # anthropic | gemini
     llm_model: str = Field(default="claude-sonnet-5", alias="LLM_MODEL")
+    gemini_model: str = Field(default="gemini-3.6-flash", alias="GEMINI_MODEL")
     spacy_model: str = Field(default="en_core_web_sm", alias="SPACY_MODEL")
 
     # --- Corpus / data locations (REQ-CORPUS-01, REQ-CORPUS-02) ---
@@ -54,7 +57,10 @@ class Settings(BaseSettings):
 
     # --- Multi-Intent Decomposer (REQ-INTENT-01/02, pseudocode 12.B) ---
     merge_threshold: float = Field(default=0.85, alias="MERGE_THRESHOLD")
-    decompose_timeout_ms: int = Field(default=1500, gt=0, alias="DECOMPOSE_TIMEOUT_MS")
+    # 10s, not 1.5s: a real structured-decomposition call (Anthropic tool-use or Gemini JSON mode)
+    # measured ~5.2s round-trip in practice, and Gemini's API additionally hard-rejects any
+    # request deadline under 10s outright (400 INVALID_ARGUMENT) before attempting generation.
+    decompose_timeout_ms: int = Field(default=10_000, gt=0, alias="DECOMPOSE_TIMEOUT_MS")
 
     # --- Evidence fusion / reranking (REQ-EVID-01..04) ---
     dedup_threshold: float = Field(default=0.95, alias="DEDUP_THRESHOLD")
