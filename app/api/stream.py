@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
@@ -28,6 +29,9 @@ from app.models import new_id
 from app.models.transcript_chunk import TranscriptChunk
 from app.retrieval.hybrid import HybridRetriever
 from app.session.session_store import SessionExpiredError, SessionStore, UnknownSessionError
+from app.telemetry.event_logger import EventLogger
+
+log = structlog.get_logger()
 
 router = APIRouter()
 
@@ -73,6 +77,7 @@ async def stream_endpoint(websocket: WebSocket, session_id: str) -> None:
 
     store: SessionStore = websocket.app.state.session_store
     retriever: HybridRetriever = websocket.app.state.hybrid_retriever
+    event_logger: EventLogger = websocket.app.state.event_logger
 
     try:
         record = await store.get(session_id)
@@ -87,6 +92,15 @@ async def stream_endpoint(websocket: WebSocket, session_id: str) -> None:
     def sink(event: TelemetryEvent) -> None:
         record.event_log.append(event)
         queue.put_nowait(event)
+        # Phase 8 (REQ-OBS-02): also persist to the process-wide, connection-independent log -
+        # this must never take down the live-delivery path above if it fails. EventLogger.sink()
+        # already guards its own body, but this call site does not trust that alone (the same
+        # "never trust a single layer" convention as e.g. decompose()'s own timeout enforcement
+        # not trusting a DecompositionLLM implementation's self-reported timeout handling).
+        try:
+            event_logger.sink(event)
+        except Exception:
+            log.exception("telemetry_persist_failed", event_type=event.event_type.value)
 
     sender_task = asyncio.create_task(_drain_events(websocket, queue))
     try:

@@ -411,3 +411,245 @@ def test_reconnect_resumes_state(app_client):
         send_chunk(ws, 1, ", and the cancellation policy", 100)
         decision = ws.receive_json()
         assert decision["event_type"] == "RETRIEVAL_DECISION"
+
+
+# --- Phase 8: Telemetry / Observability (REQ-OBS-01..04) -----------------------------------------
+
+
+def get_events_json(client: TestClient, session_id: str, **params) -> list[dict]:
+    query = "&".join(["format=json", *(f"{k}={v}" for k, v in params.items())])
+    resp = client.get(f"/session/{session_id}/events?{query}", headers=auth_header())
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_events_endpoint_requires_api_key(app_client):
+    session_id = create_session(app_client)["session_id"]
+    resp = app_client.get(f"/session/{session_id}/events?format=json")
+    assert resp.status_code == 401
+
+
+def test_events_endpoint_unknown_session_returns_404(app_client):
+    resp = app_client.get("/session/nonexistent/events?format=json", headers=auth_header())
+    assert resp.status_code == 404
+
+
+def test_events_endpoint_default_format_is_sse(app_client):
+    session_id = create_session(app_client)["session_id"]
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, "hello", 0)
+        ws.receive_json()
+
+    resp = app_client.get(f"/session/{session_id}/events", headers=auth_header())
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert resp.text.startswith("data: ")
+
+
+# --- 1. Every required stage transition emits telemetry / 2. payload/schema correctness ----------
+
+
+def test_persisted_events_cover_the_full_retrieve_turn_with_correct_schemas(app_client):
+    """REQ-OBS-01/02: every event a RETRIEVE turn produces over the live socket is also
+    independently queryable from the persistent store afterwards, with the exact documented
+    payload fields (docs/TELEMETRY.md §2)."""
+    session_id = create_session(app_client)["session_id"]
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, BASE_UTTERANCE, 0)
+        ws.receive_json()
+        send_chunk(ws, 1, BASE_UTTERANCE + ", for 30 guests", 500)
+        receive_retrieve_turn(ws)
+
+    events = get_events_json(app_client, session_id)
+    by_type = {}
+    for e in events:
+        by_type.setdefault(e["event_type"], []).append(e)
+
+    decision = by_type["RETRIEVAL_DECISION"][-1]
+    assert {"decision", "trigger", "reason"} <= decision["payload"].keys()
+    assert decision["payload"]["decision"] == "RETRIEVE"
+
+    subquery = by_type["SUBQUERY_CREATED"][0]
+    assert {"sub_query_id", "text", "intent_label"} <= subquery["payload"].keys()
+
+    started = by_type["RETRIEVAL_STARTED"][0]
+    assert {"sub_query_id", "mode", "t_offset_ms", "trigger"} <= started["payload"].keys()
+
+    completed = by_type["RETRIEVAL_COMPLETED"][0]
+    assert {
+        "sub_query_id",
+        "mode",
+        "result_count",
+        "latency_ms",
+        "result_chunk_ids",
+        "scores",
+        "t_offset_ms",
+        "trigger",
+    } <= completed["payload"].keys()
+
+    rerank = by_type["RERANK_COMPLETED"][0]
+    assert {"sub_query_id", "ranked_chunk_ids", "scores"} <= rerank["payload"].keys()
+
+    # every event this turn produced shares one trace_id (REQ-OBS-01's envelope contract).
+    turn_trace_ids = {e["trace_id"] for e in events if e["event_type"] != "RETRIEVAL_DECISION"} | {
+        decision["trace_id"]
+    }
+    assert len(turn_trace_ids) == 1
+    assert all(e["session_id"] == session_id for e in events)
+
+
+# --- 3. SESSION_RESYNC telemetry ---------------------------------------------------------------
+
+
+def test_session_resync_is_persisted_and_queryable(app_client):
+    session_id = create_session(app_client)["session_id"]
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, "Orion Hall for 30 guests", 0)
+        ws.receive_json()
+
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        ws.receive_json()  # the live SESSION_RESYNC frame itself
+
+    events = get_events_json(app_client, session_id, event_type="SESSION_RESYNC")
+    assert len(events) == 1
+    assert events[0]["payload"]["entities"] == {"venue": "Orion Hall", "capacity": "30"}
+
+
+# --- 6. Telemetry under multi-intent retrieval ------------------------------------------------
+
+
+def test_multi_intent_events_are_all_persisted(app_client, monkeypatch):
+    monkeypatch.setattr(
+        multi_intent,
+        "get_decomposer",
+        lambda: FakeDecomposer(
+            sub_queries=[
+                {"text": "cancellation policy for Orion Hall", "intent_label": "cancellation"},
+                {"text": "catering options for Orion Hall", "intent_label": "catering"},
+            ]
+        ),
+    )
+    session_id = create_session(app_client)["session_id"]
+    base = (
+        "I am planning a corporate event next month and I need to book a venue that can "
+        "comfortably fit everyone and I have several detailed questions about the arrangements "
+        "before I can confirm the final booking with my team"
+    )
+    compound_clause = ", the cancellation policy and the catering options for Orion Hall"
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, base, 0)
+        ws.receive_json()
+        send_chunk(ws, 1, base + compound_clause, 500)
+        receive_retrieve_turn(ws, expected_sub_queries=2)
+
+    events = get_events_json(app_client, session_id)
+    subqueries = [e for e in events if e["event_type"] == "SUBQUERY_CREATED"]
+    started = [e for e in events if e["event_type"] == "RETRIEVAL_STARTED"]
+    rerank = [e for e in events if e["event_type"] == "RERANK_COMPLETED"]
+    assert len(subqueries) == 2
+    assert len(started) == 4  # 2 sub-queries x (dense, sparse)
+    assert len(rerank) == 2
+    assert {e["payload"]["trigger"] for e in started} == {"provisional", "multi_intent"}
+
+
+# --- 7. Telemetry during session refinement --------------------------------------------------
+
+
+def test_refinement_events_are_persisted(app_client, monkeypatch):
+    """A second RETRIEVE turn (REQ-SESS-01 refinement, Phase 6) still lands its own
+    RETRIEVAL_DECISION/SUBQUERY_CREATED/etc in the persistent store, tagged with the delta
+    trigger."""
+    monkeypatch.setattr(retrieval_controller, "classify_segment", lambda *a, **k: "refinement")
+    session_id = create_session(app_client)["session_id"]
+    base = "I need to know more about Orion Hall for my upcoming event booking"
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, base, 0)
+        ws.receive_json()
+        send_chunk(ws, 1, base + ", for 30 guests", 500)
+        receive_retrieve_turn(ws)
+        ws.receive_json()  # UNCERTAINTY - grounded generation finds this vague query's evidence
+        # insufficient (Phase 7); every RETRIEVE turn runs stream_answer regardless of trigger,
+        # so this trailing event must be drained before the next chunk's own decision arrives.
+
+        send_chunk(ws, 2, ", cancellation policy", 1000)
+        second_decision = ws.receive_json()
+        assert second_decision["payload"]["trigger"] == "delta"
+        receive_n(ws, 6)  # subquery_created + 4 retrieval + rerank_completed for the delta turn
+
+    events = get_events_json(app_client, session_id)
+    decisions = [e for e in events if e["event_type"] == "RETRIEVAL_DECISION"]
+    # chunk 0's own WAIT decision (trigger=None) is persisted too - only the two RETRIEVE
+    # decisions that follow it carry a trigger.
+    assert [d["payload"]["trigger"] for d in decisions] == [None, "provisional", "delta"]
+
+
+# --- 8. Telemetry during grounded answer generation --------------------------------------------
+
+
+def test_generation_events_are_persisted(app_client, monkeypatch):
+    monkeypatch.setattr(
+        streaming_generator,
+        "get_generator",
+        lambda: FakeGenerationLLM(
+            chunks=[
+                "A booking at Orion Hall can be cancelled free of charge up to 14 days before the "
+                "event [orion_hall §3]."
+            ]
+        ),
+    )
+    session_id = create_session(app_client)["session_id"]
+    base = "I need to know more about Orion Hall for my upcoming event booking"
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, base, 0)
+        ws.receive_json()
+        send_chunk(ws, 1, base + ", the cancellation policy", 500)
+        receive_retrieve_turn(ws)
+        ws.receive_json()  # CITATION_CREATED
+        ws.receive_json()  # ANSWER_DELTA
+        ws.receive_json()  # ANSWER_VERSION_CREATED
+
+    events = get_events_json(app_client, session_id)
+    assert any(e["event_type"] == "CITATION_CREATED" for e in events)
+    assert any(e["event_type"] == "ANSWER_DELTA" for e in events)
+    version_events = [e for e in events if e["event_type"] == "ANSWER_VERSION_CREATED"]
+    assert len(version_events) == 1
+    assert version_events[0]["payload"]["version_no"] == 1
+
+
+# --- 9. Telemetry failure does not break the request --------------------------------------------
+
+
+def test_broken_event_logger_never_breaks_the_websocket(app_client, monkeypatch):
+    def _broken_sink(event):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(app_client.app.state.event_logger, "sink", _broken_sink)
+    session_id = create_session(app_client)["session_id"]
+    with app_client.websocket_connect(f"/session/{session_id}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, BASE_UTTERANCE, 0)
+        decision = ws.receive_json()  # must still arrive over the live socket
+        assert decision["payload"]["decision"] == "WAIT"
+        send_chunk(ws, 1, BASE_UTTERANCE + ", for 30 guests", 500)
+        receive_retrieve_turn(ws)  # the whole turn still completes normally
+
+
+# --- 10. Session/corpus isolation in telemetry --------------------------------------------------
+
+
+def test_events_endpoint_never_leaks_another_sessions_events(app_client):
+    alpha_session = create_session(app_client, "alpha")["session_id"]
+    beta_session = create_session(app_client, "beta")["session_id"]
+
+    with app_client.websocket_connect(f"/session/{alpha_session}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, "hello", 0)
+        ws.receive_json()
+
+    with app_client.websocket_connect(f"/session/{beta_session}/stream?token={API_KEY}") as ws:
+        send_chunk(ws, 0, "hello", 0)
+        ws.receive_json()
+
+    alpha_events = get_events_json(app_client, alpha_session)
+    beta_events = get_events_json(app_client, beta_session)
+    assert alpha_events and beta_events
+    assert all(e["session_id"] == alpha_session for e in alpha_events)
+    assert all(e["session_id"] == beta_session for e in beta_events)

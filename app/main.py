@@ -16,6 +16,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from app.api import events as events_router
 from app.api import session as session_router
 from app.api import stream as stream_router
 from app.controller import entity_extraction
@@ -25,6 +26,7 @@ from app.retrieval.dense import DenseIndex, create_qdrant_client
 from app.retrieval.hybrid import HybridRetriever
 from app.retrieval.sparse_bm25 import SparseIndexRegistry
 from app.session.session_store import SessionStore
+from app.telemetry.event_logger import EventLogger
 
 structlog.configure(
     processors=[
@@ -78,9 +80,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # bind), and sets this flag from its outcome. Until then ingestion runs via the CLI.
     app.state.ingestion_complete = True
 
+    # Phase 8 (REQ-OBS-02/04): one process-wide, non-blocking event logger, started before
+    # anything that might emit telemetry so no early event is silently dropped.
+    event_logger = EventLogger(settings)
+    await event_logger.start()
+    app.state.event_logger = event_logger
+
     # Composition root for Phase 3: one shared retriever + session store per process. Construction
     # is cheap (no I/O until first use) and reuses the already-warmed embedder singleton.
-    app.state.session_store = SessionStore(settings)
+    app.state.session_store = SessionStore(settings, sink=event_logger.sink)
     qdrant_client = create_qdrant_client(settings.qdrant_url)
     dense_index = DenseIndex(qdrant_client, get_embedder(), settings)
     sparse_index = SparseIndexRegistry(settings)
@@ -92,6 +100,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     for task in warmup_tasks:
         task.cancel()
     await qdrant_client.close()
+    await event_logger.stop()
     log.info("shutdown")
 
 
@@ -111,6 +120,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Streaming Live RAG", version="0.1.0", lifespan=lifespan)
     app.include_router(session_router.router)
     app.include_router(stream_router.router)
+    app.include_router(events_router.router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

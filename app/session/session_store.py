@@ -13,11 +13,12 @@ for the current, more limited claim tracking (AnswerVersion.new_claim_ids only).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from enum import StrEnum
 
 from app.core.config import Settings, get_settings
-from app.core.events import TelemetryEvent
+from app.core.events import EventSink, EventType, TelemetryEvent
 from app.core.slots import validate_corpus_id
 from app.models import new_id
 from app.models.answer_version import AnswerVersion
@@ -141,10 +142,14 @@ class SessionStore:
     """Process-wide session registry. Every lookup is keyed exclusively by session_id
     (REQ-SESS-03) — there is no query path that can return another session's state."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, *, sink: EventSink | None = None) -> None:
         self._settings = settings or get_settings()
         self._sessions: dict[str, SessionRecord] = {}
         self._lock = asyncio.Lock()
+        # Phase 8 (REQ-OBS-01/02): SESSION_UPDATED for status transitions this store itself
+        # detects (TTL expiry, explicit close) — decoupled from any one WebSocket connection, so
+        # it fires even when the transition is noticed during an unrelated request.
+        self._sink = sink
 
     async def create(self, corpus_id: str) -> SessionRecord:
         corpus_id = validate_corpus_id(corpus_id)
@@ -164,7 +169,7 @@ class SessionStore:
             raise SessionExpiredError(session_id)
         age = (datetime.now(UTC) - record.last_active_at).total_seconds()
         if age > self._settings.session_ttl_seconds:
-            record.status = SessionStatus.CLOSED
+            self._close_record(record, session_id)
             raise SessionExpiredError(session_id)
         return record
 
@@ -175,8 +180,22 @@ class SessionStore:
     async def close(self, session_id: str) -> None:
         async with self._lock:
             record = self._sessions.get(session_id)
-        if record is not None:
-            record.status = SessionStatus.CLOSED
+        if record is not None and record.status != SessionStatus.CLOSED:
+            self._close_record(record, session_id)
+
+    def _close_record(self, record: SessionRecord, session_id: str) -> None:
+        record.status = SessionStatus.CLOSED
+        event = TelemetryEvent(
+            session_id=session_id,
+            trace_id=new_id(),
+            event_type=EventType.SESSION_UPDATED,
+            payload={"field": "status", "old_value": "active", "new_value": "closed"},
+        )
+        record.event_log.append(event)
+        if self._sink is not None:
+            # telemetry must never break a session-lifecycle transition
+            with contextlib.suppress(Exception):
+                self._sink(event)
 
     async def mark_connected(self, session_id: str) -> bool:
         """Returns True iff a WebSocket has already been attached to this session before (i.e.
@@ -188,3 +207,10 @@ class SessionStore:
 
     def __len__(self) -> int:
         return len(self._sessions)
+
+    def __contains__(self, session_id: str) -> bool:
+        """Side-effect-free existence check (no expiry check, no status mutation) - unlike
+        `get()`, which is deliberately unsuitable here since it can itself mutate `status` on a
+        TTL-expiry detection. Used by GET /session/{id}/events (REQ-OBS-03) to distinguish a
+        session_id this process never created at all from one that simply has no matching events."""
+        return session_id in self._sessions
