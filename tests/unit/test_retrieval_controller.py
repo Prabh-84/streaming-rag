@@ -713,3 +713,345 @@ async def test_multi_intent_evidence_fusion_mixes_both_subqueries_into_final_set
     assert decision.decision == ctrl.RETRIEVE
     represented_sub_queries = {e.sub_query_id for e in decision.evidence}
     assert represented_sub_queries == set(decision.sub_query_ids)  # both sub-intents represented
+
+
+# --- Section I: Session Refinement (Phase 6, REQ-SESS-01) ---------------------------------------
+
+
+def _real_chunk(chunk_id: str, text: str, corpus_id: str = "alpha"):
+    from app.models.chunk import RetrievedChunk
+
+    return RetrievedChunk(
+        chunk_id=chunk_id,
+        doc_id="doc",
+        corpus_id=corpus_id,
+        section="§1",
+        text=text,
+        chunk_index=0,
+        token_count=len(text.split()),
+        score=0.9,
+        rank=1,
+    )
+
+
+class ScriptedRetriever:
+    """Returns a different, pre-configured set of dense chunks on each successive call - lets a
+    test tell precisely which retrieval call's content ended up in the final evidence, rather
+    than FakeRetriever's always-empty result."""
+
+    def __init__(self, results_by_call: list[list]) -> None:
+        self.calls: list = []
+        self._results = results_by_call
+
+    async def retrieve(self, request, *, sink=None) -> RetrievalResult:
+        self.calls.append(request)
+        chunks = self._results[len(self.calls) - 1]
+        return RetrievalResult(
+            sub_query_id=request.sub_query_id, corpus_id=request.corpus_id, dense=chunks, sparse=[]
+        )
+
+
+async def test_refinement_with_no_new_information_waits_and_keeps_prior_evidence(
+    session, embedder, settings, monkeypatch
+):
+    """#1 + #3: no new entity delta after an established topic still WAITs (unchanged Phase 3
+    behavior), and the prior turn's evidence is left intact, ready to be reused."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    chunk_a = _real_chunk("00000000-0000-0000-0000-00000000000a", "Orion Hall seats 30 guests")
+    retriever = ScriptedRetriever([[chunk_a]])
+
+    first = await run_chunk(
+        session,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+    assert first.decision == ctrl.RETRIEVE
+    assert first.evidence and first.evidence[0].chunk_id == chunk_a.chunk_id
+    prior_evidence = session.last_evidence
+    assert prior_evidence
+
+    second = await run_chunk(
+        session, " please", 400, retriever=retriever, embedder=embedder, settings=settings
+    )
+    assert second.decision == ctrl.WAIT
+    assert second.reason == "no_new_entity"
+    assert len(retriever.calls) == 1  # no new retrieval call
+    assert session.last_evidence == prior_evidence  # untouched, still there to reuse
+
+
+async def test_refinement_with_new_information_retrieves_only_the_delta(
+    session, embedder, settings, monkeypatch
+):
+    """#2 + #4: an established topic plus a genuine entity delta, classified as a refinement,
+    retrieves only for the delta text - never the whole accumulated buffer - and the resulting
+    evidence is the newly retrieved content."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    chunk_a = _real_chunk("00000000-0000-0000-0000-00000000000a", "Orion Hall seats 30 guests")
+    chunk_b = _real_chunk(
+        "00000000-0000-0000-0000-00000000000b", "Orion Hall cancellation policy is flexible"
+    )
+    retriever = ScriptedRetriever([[chunk_a], [chunk_b]])
+
+    await run_chunk(
+        session,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+    monkeypatch.setattr(ctrl, "classify_segment", lambda *a, **k: "refinement")
+    second = await run_chunk(
+        session,
+        " and the cancellation policy",
+        400,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+
+    assert second.decision == ctrl.RETRIEVE
+    assert second.trigger == RetrievalTrigger.DELTA
+    assert second.reason == "refinement"
+    assert len(retriever.calls) == 2
+    assert retriever.calls[1].text != session.buffer_text()  # delta text, not the whole buffer
+    assert "cancellation_policy" in retriever.calls[1].text
+    assert second.evidence and second.evidence[0].chunk_id == chunk_b.chunk_id
+
+
+async def test_refinement_reuses_prior_evidence_when_delta_retrieval_finds_nothing(
+    session, embedder, settings, monkeypatch
+):
+    """#3: REQ-SESS-01's "reuse prior evidence when appropriate" - a refinement whose delta
+    retrieval comes back empty falls back to the prior turn's evidence instead of going
+    evidence-less."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    chunk_a = _real_chunk("00000000-0000-0000-0000-00000000000a", "Orion Hall seats 30 guests")
+    retriever = ScriptedRetriever([[chunk_a], []])  # second call finds nothing
+
+    await run_chunk(
+        session,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+    monkeypatch.setattr(ctrl, "classify_segment", lambda *a, **k: "refinement")
+    second = await run_chunk(
+        session,
+        " and the cancellation policy",
+        400,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+    assert second.decision == ctrl.RETRIEVE
+    assert second.evidence
+    assert second.evidence[0].chunk_id == chunk_a.chunk_id  # the prior evidence, reused
+
+
+async def test_ambiguous_refinement_never_guesses(session, embedder, settings, monkeypatch):
+    """REQ-SESS-01 failure clause via the controller: an ambiguous classification returns
+    NO_RETRIEVAL rather than picking refinement or new_topic."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    chunk_a = _real_chunk("00000000-0000-0000-0000-00000000000a", "Orion Hall seats 30 guests")
+    retriever = ScriptedRetriever([[chunk_a]])
+
+    await run_chunk(
+        session,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+    monkeypatch.setattr(ctrl, "classify_segment", lambda *a, **k: "ambiguous")
+    second = await run_chunk(
+        session,
+        " and the cancellation policy",
+        400,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+    assert second.decision == ctrl.NO_RETRIEVAL
+    assert second.reason == "ambiguous_refinement"
+    assert len(retriever.calls) == 1  # no second retrieval call
+
+
+async def test_refinement_state_is_isolated_between_sessions(settings, monkeypatch):
+    """#5: two sessions refining independently never share topic_embedding/last_evidence/entities
+    state (REQ-SESS-03)."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    store = SessionStore(settings)
+    session_a = await store.create("alpha")
+    session_b = await store.create("alpha")
+    embedder = FakeEmbedder()
+
+    chunk_a1 = _real_chunk("00000000-0000-0000-0000-0000000000a1", "Orion Hall seats 30 guests")
+    chunk_b1 = _real_chunk("00000000-0000-0000-0000-0000000000b1", "Lumen Pavilion seats 50 guests")
+    retriever_a = ScriptedRetriever([[chunk_a1]])
+    retriever_b = ScriptedRetriever([[chunk_b1]])
+
+    await run_chunk(
+        session_a,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever_a,
+        embedder=embedder,
+        settings=settings,
+    )
+    await run_chunk(
+        session_b,
+        "Lumen Pavilion for 50 guests",
+        0,
+        retriever=retriever_b,
+        embedder=embedder,
+        settings=settings,
+    )
+
+    assert session_a.topic_embedding != session_b.topic_embedding
+    assert session_a.last_evidence[0].chunk_id == chunk_a1.chunk_id
+    assert session_b.last_evidence[0].chunk_id == chunk_b1.chunk_id
+    assert session_a.entities != session_b.entities
+
+
+async def test_refinement_preserves_corpus_isolation(settings, monkeypatch):
+    """#6: a refinement's delta retrieval is scoped to the session's own corpus_id, never another
+    session's corpus, even for two sessions on different corpora refining concurrently."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    store = SessionStore(settings)
+    session_alpha = await store.create("alpha")
+    session_beta = await store.create("beta")
+    embedder = FakeEmbedder()
+
+    chunk_alpha = _real_chunk(
+        "00000000-0000-0000-0000-0000000000c1", "Orion Hall seats 30 guests", corpus_id="alpha"
+    )
+    chunk_beta = _real_chunk(
+        "00000000-0000-0000-0000-0000000000c2", "domestic trips use USD", corpus_id="beta"
+    )
+    retriever_alpha = ScriptedRetriever([[chunk_alpha], [chunk_alpha]])
+    retriever_beta = ScriptedRetriever([[chunk_beta], [chunk_beta]])
+
+    await run_chunk(
+        session_alpha,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever_alpha,
+        embedder=embedder,
+        settings=settings,
+    )
+    await run_chunk(
+        session_beta,
+        "domestic trip using USD",
+        0,
+        retriever=retriever_beta,
+        embedder=embedder,
+        settings=settings,
+    )
+
+    monkeypatch.setattr(ctrl, "classify_segment", lambda *a, **k: "refinement")
+    await run_chunk(
+        session_alpha,
+        " and the cancellation policy",
+        400,
+        retriever=retriever_alpha,
+        embedder=embedder,
+        settings=settings,
+    )
+    await run_chunk(
+        session_beta,
+        " but use EUR instead",
+        400,
+        retriever=retriever_beta,
+        embedder=embedder,
+        settings=settings,
+    )
+
+    assert all(r.corpus_id == "alpha" for r in retriever_alpha.calls)
+    assert all(r.corpus_id == "beta" for r in retriever_beta.calls)
+
+
+async def test_refinement_interacts_correctly_with_a_prior_multi_intent_turn(
+    session, embedder, settings, monkeypatch
+):
+    """#7: multi-turn/multi-intent interaction - turn 1 is a genuine compound (multi-intent)
+    request producing two sub-queries; turn 2 is a refinement building on the entity state that
+    compound turn left behind. Both Phase 4 decomposition and Phase 6 refinement must keep
+    working together, neither one clobbering the other's state."""
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+    chunk_cancel = _real_chunk(
+        "00000000-0000-0000-0000-00000000000c", "Orion Hall cancellation policy is flexible"
+    )
+    chunk_catering = _real_chunk(
+        "00000000-0000-0000-0000-00000000000d", "Orion Hall catering includes vegetarian options"
+    )
+    chunk_capacity = _real_chunk(
+        "00000000-0000-0000-0000-00000000000e", "Orion Hall seats up to 50 guests"
+    )
+    retriever = ScriptedRetriever([[chunk_cancel], [chunk_catering], [chunk_capacity]])
+    llm = FakeDecomposer(
+        sub_queries=[
+            {"text": "cancellation policy for Orion Hall", "intent_label": "cancellation"},
+            {"text": "catering options for Orion Hall", "intent_label": "catering"},
+        ]
+    )
+
+    first = await run_chunk(
+        session,
+        COMPOUND_TEXT,
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+        llm=llm,
+    )
+    assert first.decision == ctrl.RETRIEVE
+    assert len(first.sub_query_ids) == 2
+    assert len(retriever.calls) == 2
+    assert session.entities  # venue/cancellation_policy/catering captured from turn 1
+
+    monkeypatch.setattr(ctrl, "classify_segment", lambda *a, **k: "refinement")
+    second = await run_chunk(
+        session,
+        " for 50 guests",
+        1000,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+        llm=FakeDecomposer(sub_queries=None),  # delta text is single-intent
+    )
+    assert second.decision == ctrl.RETRIEVE
+    assert second.trigger == RetrievalTrigger.DELTA
+    assert len(retriever.calls) == 3  # exactly one more call, scoped to the delta
+    assert "capacity" in retriever.calls[2].text
+    assert second.evidence and second.evidence[0].chunk_id == chunk_capacity.chunk_id
+
+
+async def test_first_turn_never_reaches_refinement_classification(
+    session, retriever, embedder, settings, monkeypatch
+):
+    """#8: a fresh session's first chunk must never be classified for refinement - there is no
+    established topic yet (topic_embedding is None, has_retrieved_for_topic is False), so
+    behavior must be identical to pre-Phase-6 Phase 3."""
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("classify_segment must not be called before any topic is established")
+
+    monkeypatch.setattr(ctrl, "classify_segment", _fail_if_called)
+    monkeypatch.setattr(ctrl, "compute_stability", lambda history, window: 0.99)
+
+    decision = await run_chunk(
+        session,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+    )
+    assert decision.decision == ctrl.RETRIEVE  # unchanged Phase 3 first-turn behavior

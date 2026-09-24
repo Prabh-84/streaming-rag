@@ -16,9 +16,17 @@ After all sub-queries are retrieved, their results are fused (RRF + dedup + cont
 flagging, REQ-EVID-02/04, retrieval/fusion.py), reranked per sub-query and capped globally
 (REQ-EVID-03, reranking/cross_encoder.py) into the final evidence set for the turn.
 
-Out of scope for this phase (later phases): session-answer refinement, grounding, answer
-generation. `check_suppression`'s ambiguous-match branch is deterministic-only here (no LLM
-call) — see app.controller.suppression.
+Once a session has an established topic, a later chunk carrying a genuine entity delta is
+classified (pseudocode 12.G; REQ-SESS-01, session/delta_engine.py) as a refinement of that topic,
+a genuinely new topic, or ambiguous, instead of always re-running the full pipeline over the
+whole buffer. A refinement retrieves only for the delta (`_refine`, reusing the exact same
+decompose/retrieve/fuse/rerank machinery `_retrieve` uses); "no new information" reuses
+`session.last_evidence` untouched (the existing `no_new_entity` WAIT branch, unchanged); an
+ambiguous segment never guesses (`NO_RETRIEVAL{reason="ambiguous_refinement"}`).
+
+Out of scope for this phase (later phases): claim-lifecycle bookkeeping (REQ-SESS-02, depends on
+claims extracted from a synthesized answer), grounding, answer generation. `check_suppression`'s
+ambiguous-match branch is deterministic-only here (no LLM call) — see app.controller.suppression.
 """
 
 from __future__ import annotations
@@ -46,6 +54,7 @@ from app.reranking.cross_encoder import (
 )
 from app.retrieval.fusion import dedup, flag_contradictions, rrf_fuse
 from app.retrieval.hybrid import HybridRetriever
+from app.session.delta_engine import build_delta_query, classify_segment
 from app.session.session_store import SessionRecord
 
 WAIT = "WAIT"
@@ -124,12 +133,40 @@ async def on_chunk(
     if not delta and session.has_retrieved_for_topic:
         return _decide(session, trace_id, sink, WAIT, "no_new_entity")
 
+    if session.has_retrieved_for_topic and session.topic_embedding is not None:
+        # Phase 6 (REQ-SESS-01): an established topic + a genuine entity delta - classify before
+        # falling back to the full pipeline, so a same-topic refinement retrieves only for the
+        # delta rather than re-decomposing and re-retrieving the entire accumulated buffer.
+        classification = classify_segment(
+            chunk.text_delta, session.topic_embedding, embedder, settings
+        )
+        if classification == "ambiguous":
+            return _decide(session, trace_id, sink, NO_RETRIEVAL, "ambiguous_refinement")
+        if classification == "refinement":
+            decision = await _refine(
+                session,
+                chunk,
+                trace_id,
+                retriever,
+                sink,
+                delta,
+                llm=llm,
+                embedder=embedder,
+                reranker=reranker,
+                settings=settings,
+            )
+            session.topic_embedding = embedding
+            session.last_evidence = decision.evidence
+            return decision
+        # classification == "new_topic": fall through below, exactly as if this session had
+        # never retrieved before - a fresh multi-intent decomposition over the whole buffer.
+
     stability = compute_stability(session.embedding_history, settings.stability_window)
     if stability < settings.stability_threshold or not delta:
         session.wait_count += 1
         if session.wait_count > settings.max_wait_chunks:
             session.wait_count = 0
-            return await _retrieve(
+            decision = await _retrieve(
                 session,
                 chunk,
                 trace_id,
@@ -141,12 +178,15 @@ async def on_chunk(
                 reranker=reranker,
                 settings=settings,
             )
+            session.topic_embedding = embedding
+            session.last_evidence = decision.evidence
+            return decision
         return _decide(session, trace_id, sink, WAIT, "intent_unstable")
 
     session.wait_count = 0
     session.has_retrieved_for_topic = True
     trigger = RetrievalTrigger.FINAL if chunk.is_final else RetrievalTrigger.PROVISIONAL
-    return await _retrieve(
+    decision = await _retrieve(
         session,
         chunk,
         trace_id,
@@ -158,6 +198,9 @@ async def on_chunk(
         reranker=reranker,
         settings=settings,
     )
+    session.topic_embedding = embedding
+    session.last_evidence = decision.evidence
+    return decision
 
 
 async def _retrieve(
@@ -190,27 +233,17 @@ async def _retrieve(
         sink=sink,
     )
 
-    requests = [
-        RetrievalRequest(
-            session_id=session.session_id,
-            trace_id=trace_id,
-            sub_query_id=sub_query.sub_query_id,
-            text=sub_query.text,
-            corpus_id=session.corpus_id,
-            # The first sub-query keeps the controller's own trigger; any additional sub-query
-            # produced by genuine decomposition is tagged multi_intent (REQ-OBS-05), distinct
-            # from the trigger that caused the decision to retrieve in the first place.
-            trigger=trigger if i == 0 else RetrievalTrigger.MULTI_INTENT,
-            t_offset_ms=chunk.t_offset_ms,
-        )
-        for i, sub_query in enumerate(sub_queries)
-    ]
-    results = await asyncio.gather(
-        *(retriever.retrieve(request, sink=sink) for request in requests)
-    )
-
-    evidence = await _fuse_and_rerank(
-        session, trace_id, sink, results, sub_queries, embedder, reranker, settings
+    results, evidence = await _dispatch_and_fuse(
+        session,
+        chunk,
+        trace_id,
+        retriever,
+        sink,
+        trigger,
+        sub_queries,
+        embedder,
+        reranker,
+        settings,
     )
 
     return ControllerDecision(
@@ -218,9 +251,110 @@ async def _retrieve(
         reason=trigger.value,
         trigger=trigger,
         sub_query_ids=[sq.sub_query_id for sq in sub_queries],
-        retrievals=list(results),
+        retrievals=results,
         evidence=evidence,
     )
+
+
+async def _refine(
+    session: SessionRecord,
+    chunk: TranscriptChunk,
+    trace_id: str,
+    retriever: HybridRetriever,
+    sink: EventSink | None,
+    delta_entities: dict[str, str],
+    *,
+    llm: DecompositionLLM | None = None,
+    embedder: Embedder | None = None,
+    reranker: Reranker | None = None,
+    settings: Settings | None = None,
+) -> ControllerDecision:
+    """REQ-SESS-01 refinement path (pseudocode 12.G): retrieve only for the delta entities, not
+    the whole buffer. Reuses the exact same decomposition (so a compound delta still splits into
+    multiple sub-queries, REQ-INTENT-01) and fusion/reranking machinery `_retrieve` uses — the
+    only difference is the input text and the DELTA trigger."""
+    settings = settings or get_settings()
+    embedder = embedder or get_embedder()
+    reranker = reranker or get_reranker()
+    trigger = RetrievalTrigger.DELTA
+    _emit_event(session, trace_id, sink, RETRIEVE, "refinement", trigger)
+
+    delta_text = build_delta_query(delta_entities)
+    sub_queries = await decompose(
+        delta_text,
+        session.corpus_id,
+        session.session_id,
+        chunk.t_offset_ms,
+        trace_id=trace_id,
+        llm=llm,
+        embedder=embedder,
+        settings=settings,
+        sink=sink,
+    )
+
+    results, new_evidence = await _dispatch_and_fuse(
+        session,
+        chunk,
+        trace_id,
+        retriever,
+        sink,
+        trigger,
+        sub_queries,
+        embedder,
+        reranker,
+        settings,
+    )
+
+    # REQ-SESS-01's "reuse prior evidence when appropriate": a delta that retrieves nothing new
+    # (e.g. the new constraint doesn't match any chunk) still has the prior turn's evidence to
+    # fall back on, rather than the turn going evidence-less.
+    evidence = new_evidence or session.last_evidence
+
+    return ControllerDecision(
+        decision=RETRIEVE,
+        reason="refinement",
+        trigger=trigger,
+        sub_query_ids=[sq.sub_query_id for sq in sub_queries],
+        retrievals=results,
+        evidence=evidence,
+    )
+
+
+async def _dispatch_and_fuse(
+    session: SessionRecord,
+    chunk: TranscriptChunk,
+    trace_id: str,
+    retriever: HybridRetriever,
+    sink: EventSink | None,
+    trigger: RetrievalTrigger,
+    sub_queries: list[SubQuery],
+    embedder: Embedder,
+    reranker: Reranker,
+    settings: Settings,
+) -> tuple[list[RetrievalResult], list[Evidence]]:
+    """Shared by `_retrieve` and `_refine`: dispatch one concurrent retrieval per sub-query, then
+    fuse+rerank the combined results. The first sub-query keeps the caller's own trigger; any
+    additional sub-query produced by genuine decomposition is tagged multi_intent (REQ-OBS-05),
+    distinct from the trigger that caused the decision to retrieve in the first place."""
+    requests = [
+        RetrievalRequest(
+            session_id=session.session_id,
+            trace_id=trace_id,
+            sub_query_id=sub_query.sub_query_id,
+            text=sub_query.text,
+            corpus_id=session.corpus_id,
+            trigger=trigger if i == 0 else RetrievalTrigger.MULTI_INTENT,
+            t_offset_ms=chunk.t_offset_ms,
+        )
+        for i, sub_query in enumerate(sub_queries)
+    ]
+    results = list(
+        await asyncio.gather(*(retriever.retrieve(request, sink=sink) for request in requests))
+    )
+    evidence = await _fuse_and_rerank(
+        session, trace_id, sink, results, sub_queries, embedder, reranker, settings
+    )
+    return results, evidence
 
 
 async def _fuse_and_rerank(

@@ -1,12 +1,12 @@
 """In-memory session store: lifecycle CRUD, TTL expiry, per-session serialization, and the
 rolling controller/streaming state pseudocode 12.A calls `session.*`.
 
-Scope note: this is the Phase 3 subset of the Phase 6 `session_store.py` deliverable named in
-PRD_TRD.md §9/§10 — session isolation (REQ-SESS-03), corpus_id immutability (REQ-CORPUS-02), and
-the Retrieval Controller's rolling state (embedding_history, entities, wait_count,
-has_retrieved_for_topic) needed to run the WebSocket stream at all. `claims`/`answer_versions`
-population, delta refinement, and the SQLite crash-recovery mirror are Phase 6 work and are not
-implemented here — `answer_versions` stays empty for the lifetime of a session in this phase.
+Scope note: session isolation (REQ-SESS-03), corpus_id immutability (REQ-CORPUS-02), and the
+Retrieval Controller's rolling state (embedding_history, entities, wait_count,
+has_retrieved_for_topic, topic_embedding, last_evidence) needed to run the WebSocket stream and
+Phase 6 session refinement. `answer_versions`/claim-ledger population and the SQLite
+crash-recovery mirror depend on Synthesis and Grounding (later phases) and are not implemented
+here — `answer_versions` stays empty for the lifetime of a session until then.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from app.core.config import Settings, get_settings
 from app.core.events import TelemetryEvent
 from app.core.slots import validate_corpus_id
 from app.models import new_id
+from app.models.evidence import Evidence
 from app.models.transcript_chunk import TranscriptChunk
 
 
@@ -52,6 +53,12 @@ class SessionRecord:
         self.embedding_history: list[tuple[float, ...]] = []
         self.wait_count: int = 0
         self.has_retrieved_for_topic: bool = False
+
+        # Phase 6 session refinement (pseudocode 12.G): the embedding of whichever chunk most
+        # recently triggered a RETRIEVE (full pipeline or refinement), and that turn's final
+        # evidence set — reused as-is when a later turn introduces no new actionable information.
+        self.topic_embedding: tuple[float, ...] | None = None
+        self.last_evidence: list[Evidence] = []
 
         # Synthesis state — always empty in this phase (Phase 6 populates it); present now only
         # so the first-turn suppression guard (REQ-SUPPRESS-02) has something real to check.
