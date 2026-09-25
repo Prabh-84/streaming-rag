@@ -29,5 +29,19 @@ jobs:
       - run: pip install "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
       - run: pytest
 
-  # Benchmark suite job is wired up in Phase 9 once benchmarks/harness.py and
-  # scripts/run_benchmark.py exist (REQ-EVAL-01, docs/EVALUATION.md §7 Definition of Done).
+  # Phase 10 (PRD_TRD.md §10 insertion: "CI workflow runs ruff -> pytest -> benchmark"). Runs
+  # with --use-fakes: CI has no Qdrant server and no LLM API key/quota, so this exercises the
+  # real controller/decomposition-gating/retrieval/fusion/citation-validation/telemetry logic
+  # deterministically and offline, exactly as docs/EVALUATION.md's own reproducibility gate (G1)
+  # expects an automated replay to run "without intervention".
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.lock
+      - run: pip install "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
+      - run: python scripts/run_benchmark.py --use-fakes

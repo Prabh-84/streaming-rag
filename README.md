@@ -6,7 +6,7 @@ Full specification: [`PRD_TRD.md`](PRD_TRD.md), [`docs/ARCHITECTURE.md`](docs/AR
 
 ## Status
 
-**Phases 1–9 complete.** Foundation, corpus ingestion, streaming retrieval controller, multi-intent decomposition, evidence fusion/reranking, session refinement, grounded generation with citations, telemetry/observability, and the evaluation/benchmark harness are all implemented and tested. **Phase 10 (Docker hardening / production deployment polish) is not yet complete** — the app runs correctly today via `docker compose up --build` for the API itself, but the benchmark harness (`benchmarks/`) is not currently copied into the Docker image (see [§12](#12-evaluation--benchmark-usage)).
+**Phases 1–10 complete.** Foundation, corpus ingestion, streaming retrieval controller, multi-intent decomposition, evidence fusion/reranking, session refinement, grounded generation with citations, telemetry/observability, the evaluation/benchmark harness, and Docker/deployment are all implemented and tested. `docker compose up --build` is a genuine one-command deployment: it builds the current codebase into an image, starts `app` + `qdrant`, ingests every corpus under `data/corpus/` at startup, warms the embedding/spaCy models, and `/ready` only turns healthy once all of that has actually happened — verified end to end in a real container, including real Qdrant retrieval, reranking, real Gemini generation, grounded citations, telemetry, and session resync.
 
 No production corpus has been supplied yet; see [`data/corpus/README.md`](data/corpus/README.md) for where it goes. A synthetic benchmark corpus used only by the evaluation harness lives separately under `benchmarks/streaming_suite_v1/`.
 
@@ -61,7 +61,7 @@ Hybrid Retriever ◀──▶ BM25 sparse index (one pickle per corpus_id)
 
 Session Refinement is a controller-level classification (`app/session/delta_engine.py`), not a separate pipeline stage after generation: once a session has an established topic, a later chunk that changes an entity is classified as `refinement` (same topic, new constraint — only the delta is retrieved for), `new_topic` (falls back to a full fresh turn), or `ambiguous` (the controller never guesses; it asks rather than retrieving on a coin flip).
 
-## 3. Capabilities implemented (Phases 1–9)
+## 3. Capabilities implemented (Phases 1–10)
 
 | Phase | Capability |
 |---|---|
@@ -74,8 +74,7 @@ Session Refinement is a controller-level classification (`app/session/delta_engi
 | 7 | Grounding Validator + Streaming Generator: sentence-by-sentence generation, citation-tag validation against the real evidence set, one regeneration attempt, uncertainty fallback — structurally prevents fabricated citations |
 | 8 | Telemetry/Observability: async, non-blocking `EventLogger` (SQLite-backed), `GET /session/{id}/events` (SSE + JSON), `SESSION_RESYNC` on reconnect |
 | 9 | Evaluation/Benchmark harness: a 10-scenario held-out benchmark suite, the ten `TELEMETRY.md` metric formulas, `POST`/`GET /evaluate`, `scripts/run_benchmark.py` |
-
-Not yet done: Phase 10 (Docker/deployment hardening — see [Status](#status)).
+| 10 | Docker/Deployment: real startup corpus ingestion (background task, gates `/ready`), persistent Qdrant + SQLite + BM25 storage via named volumes, `benchmarks/` shipped in the image, CI benchmark job |
 
 ## 4. Technology stack
 
@@ -161,7 +160,9 @@ All settings are centralized in `app/core/config.py` (`Settings`, loaded from `.
 
 ## 8. Corpus ingestion and corpus isolation
 
-Put a corpus at `data/corpus/<corpus_id>/` (layout and `slots.yaml` schema: [`data/corpus/README.md`](data/corpus/README.md)), then:
+Put a corpus at `data/corpus/<corpus_id>/` (layout and `slots.yaml` schema: [`data/corpus/README.md`](data/corpus/README.md)) **before building the image** — `docker/Dockerfile` bakes `data/corpus` in at build time, and `app/main.py`'s startup lifespan then discovers and ingests every corpus directory under `CORPUS_ROOT` automatically, as a background task that never blocks the port bind. `/ready`'s `ingestion` field only turns `true` once that has genuinely completed for every discovered corpus; if none is mounted at all, it stays `false` forever (deliberately — see §9) rather than the container silently serving an empty index.
+
+To (re-)ingest without rebuilding the image (e.g. after editing a corpus in a running container), or for local (non-Docker) development:
 
 ```bash
 python scripts/ingest_corpus.py --corpus-id <corpus_id>   # or --all; --force to rebuild
@@ -169,7 +170,7 @@ python scripts/ingest_corpus.py --corpus-id <corpus_id>   # or --all; --force to
 docker compose -f docker/docker-compose.yml exec app python scripts/ingest_corpus.py --all
 ```
 
-Outputs: Qdrant points in the `corpus_chunks` collection (payload carries `corpus_id`), plus `data/processed/bm25__<corpus_id>.pkl`, `chunks__<corpus_id>.jsonl`, and `manifest__<corpus_id>.json`. An unchanged corpus re-ingests as a no-op. Malformed input (missing/invalid `slots.yaml`, non-UTF-8 documents, no supported documents) exits 1 and writes nothing.
+Outputs: Qdrant points in the `corpus_chunks` collection (payload carries `corpus_id`), plus `PROCESSED_DIR/bm25__<corpus_id>.pkl`, `chunks__<corpus_id>.jsonl`, and `manifest__<corpus_id>.json` (persisted at `/data/processed` in Docker, via the same `app_data` volume `SQLITE_PATH` uses — survives container recreation). An unchanged corpus re-ingests as a no-op. Malformed input (missing/invalid `slots.yaml`, non-UTF-8 documents, no supported documents) fails that corpus's ingestion and is logged; it does not crash the process.
 
 **Corpus isolation:** `corpus_id` is fixed at session creation (`POST /session`) and is immutable for that session's lifetime. Every retrieval call — dense (Qdrant payload filter) and sparse (a separate BM25 pickle per `corpus_id`) — scopes exclusively to the session's own `corpus_id`; no query path can return another corpus's chunks. This is exercised directly by `tests/integration/test_corpus_isolation.py` and `tests/unit/test_session_store.py`.
 
@@ -195,7 +196,7 @@ curl http://localhost:8000/health   # {"status":"ok"} — liveness, no dependenc
 curl http://localhost:8000/ready    # {"status":"ready","qdrant":true,"ingestion":true,"embedder":true,"nlp":true} once warm
 ```
 
-`/ready` gates on live Qdrant connectivity, ingestion having completed at least once, and both the embedding model and the spaCy model having finished warming up.
+`/ready` gates on live Qdrant connectivity, ingestion having genuinely completed for every discovered corpus, and both the embedding model and the spaCy model having finished warming up. If `data/corpus/` has no corpus directories at all, `ingestion` stays `false` forever — a deliberate design choice (PRD_TRD.md §11 risk register) so a "forgot to mount a corpus" deployment mistake surfaces as `/ready` never turning healthy, not as a container that starts fine and silently serves an empty index. In local testing, a fresh deployment (real model downloads, one small corpus) reached `ready` in about 40 seconds.
 
 ## 10. Main REST/WebSocket usage
 
@@ -240,7 +241,7 @@ Each run prints a per-scenario pass/fail, the G2–G6 gate results, and the comp
 
 The same suite can also be triggered over HTTP: `POST /evaluate` (requires `API_KEY` **and** `X-Eval-Key: $EVAL_KEY`) queues a run and returns `{"run_id", "status": "queued"}` (`202`); poll `GET /evaluate/{run_id}` for `gates`/`metrics` once `status` is `complete`. Full contract: [`docs/API.md`](docs/API.md) §7–8.
 
-**Note on Docker:** `docker/Dockerfile` currently copies `app/` and `scripts/` into the image but not `benchmarks/`, so `POST /evaluate` and `scripts/run_benchmark.py` are not yet runnable inside the built container — this is part of the Phase 10 work still outstanding. Both run correctly today from a local checkout.
+`docker/Dockerfile` copies `app/`, `scripts/`, and `benchmarks/` into the image, so both `POST /evaluate` and `scripts/run_benchmark.py` (via `docker compose exec app`) work inside the built container, not just from a local checkout.
 
 ## 13. Phase 9 measured results
 
@@ -256,7 +257,9 @@ The results below are from the offline, deterministic run (`scripts/run_benchmar
 
 ## 14. Real-provider (Gemini) benchmark attempt
 
-A genuine end-to-end run was also attempted against the real configured Gemini provider (no `--use-fakes`). It hit the Gemini API's **free-tier rate limit (HTTP 429 `RESOURCE_EXHAUSTED`, 5 requests/minute)** within the first scenario. This is an external account/quota limitation, not a defect in this codebase — the deterministic fallback-on-LLM-failure path (built in Phase 4) degraded gracefully exactly as designed rather than crashing. **The fake-provider results above are not a substitute for a full real-Gemini benchmark run**; they measure the deterministic pipeline logic, not real LLM-driven decomposition/generation quality. A real, complete run requires a Gemini key with sufficient quota (or `LLM_PROVIDER=anthropic` with a funded Anthropic key).
+A genuine end-to-end **benchmark suite** run was also attempted against the real configured Gemini provider (no `--use-fakes`) — ~10 scenarios' worth of decomposition/generation calls in quick succession. It hit the Gemini API's **free-tier rate limit (HTTP 429 `RESOURCE_EXHAUSTED`, 5 requests/minute)** within the first scenario. This is an external account/quota limitation, not a defect in this codebase — the deterministic fallback-on-LLM-failure path (built in Phase 4) degraded gracefully exactly as designed rather than crashing. **The fake-provider results in §13 are not a substitute for a full real-Gemini *benchmark suite* run**; they measure the deterministic pipeline logic, not real LLM-driven decomposition/generation quality at that request volume.
+
+A **single real request** is a different story: a Phase 10 containerized verification (fresh `docker compose up --build`, real Qdrant, real embedder/reranker, real `GEMINI_API_KEY`) sent one transcript through the live WebSocket API and got a genuine, correctly-grounded Gemini-generated answer with a valid citation back, end to end — retrieval, reranking, generation, citation, telemetry, and session resync all confirmed working against the real provider. The free-tier limit is specifically a *request-rate* ceiling (5/minute), not a "Gemini integration doesn't work" finding. A sustained real-Gemini benchmark *suite* run, or any production traffic beyond a handful of requests per minute, needs a Gemini key with sufficient quota (or `LLM_PROVIDER=anthropic` with a funded Anthropic key).
 
 ## 15. Tests and lint
 

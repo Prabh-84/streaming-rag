@@ -2,8 +2,9 @@
 
 App construction, structured logging, health endpoints (REQ-DEPLOY-01), and the composition root
 that wires the Phase 2 retrieval primitives + Phase 3 session store into app.state for the
-session/stream routers. Corpus ingestion (scripts/ingest_corpus.py) is still Phase 10's job to
-call from here; it runs via the CLI until then.
+session/stream routers. Phase 10 wires scripts/ingest_corpus.py's ingest_corpus() into the
+startup event below, per this module's own long-standing comment and PRD_TRD.md §10's Phase 10
+insertion list ("ingestion moves to FastAPI startup event").
 """
 
 from __future__ import annotations
@@ -11,23 +12,27 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import structlog
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from qdrant_client import AsyncQdrantClient
 
 from app.api import evaluate as evaluate_router
 from app.api import events as events_router
 from app.api import session as session_router
 from app.api import stream as stream_router
 from app.controller import entity_extraction
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.embeddings import get_embedder
+from app.core.slots import InvalidCorpusIdError, SlotSchemaError
 from app.retrieval.dense import DenseIndex, create_qdrant_client
 from app.retrieval.hybrid import HybridRetriever
 from app.retrieval.sparse_bm25 import SparseIndexRegistry
 from app.session.session_store import SessionStore
 from app.telemetry.event_logger import EventLogger
+from scripts.ingest_corpus import IngestionError, discover_corpora, ingest_corpus
 
 structlog.configure(
     processors=[
@@ -64,6 +69,44 @@ async def _warm_nlp(app: FastAPI) -> None:
         log.exception("nlp_warmup_failed")
 
 
+async def _ingest_corpora(
+    app: FastAPI, qdrant_client: AsyncQdrantClient, embedder: Any, settings: Settings
+) -> None:
+    """Startup corpus ingestion (REQ-DEPLOY-01; PRD_TRD.md §10's Phase 10 insertion: "ingestion
+    moves to FastAPI startup event"). Discovers every corpus_id under CORPUS_ROOT and ingests each
+    one, reusing the process-wide embedder singleton and the lifespan's own Qdrant client (never a
+    second, throwaway client). Runs as a background task, never blocking the port bind - same
+    convention as _warm_embedder/_warm_nlp.
+
+    app.state.ingestion_complete is set True only if every discovered corpus ingests (or is
+    already up to date) cleanly. A corpus directory that was never mounted at all - the "forgot to
+    provide a corpus" deployment mistake PRD_TRD.md §11's risk register names explicitly - leaves
+    this False forever, which is exactly what makes /ready never turn ready for that failure mode
+    (its whole reason for existing) rather than the container silently serving an empty index.
+    """
+    corpus_ids = discover_corpora(settings.corpus_root)
+    if not corpus_ids:
+        log.error("no_corpora_found", corpus_root=settings.corpus_root)
+        return
+    for corpus_id in corpus_ids:
+        try:
+            await ingest_corpus(
+                corpus_id, settings=settings, embedder=embedder, qdrant_client=qdrant_client
+            )
+        except (IngestionError, SlotSchemaError, InvalidCorpusIdError) as exc:
+            log.error("ingestion_failed", corpus_id=corpus_id, error=str(exc))
+            return
+        except Exception as exc:  # backend failures: Qdrant unreachable, model load, ...
+            log.error(
+                "ingestion_failed",
+                corpus_id=corpus_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return
+    app.state.ingestion_complete = True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
@@ -76,10 +119,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         asyncio.create_task(_warm_nlp(app)),
     ]
 
-    # Phase 10 (PRD_TRD.md §10) wires scripts/ingest_corpus.py's ingest_corpus() into this startup
-    # event as a background task, per REQ-DEPLOY-01 (async ingestion, never blocking the port
-    # bind), and sets this flag from its outcome. Until then ingestion runs via the CLI.
-    app.state.ingestion_complete = True
+    # Set True only once _ingest_corpora (below, started once the shared qdrant_client exists)
+    # actually completes ingesting every discovered corpus - see that function's docstring.
+    app.state.ingestion_complete = False
 
     # Phase 8 (REQ-OBS-02/04): one process-wide, non-blocking event logger, started before
     # anything that might emit telemetry so no early event is silently dropped.
@@ -100,6 +142,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     sparse_index = SparseIndexRegistry(settings)
     app.state.sparse_index = sparse_index
     app.state.hybrid_retriever = HybridRetriever(dense_index, sparse_index, settings)
+
+    warmup_tasks.append(
+        asyncio.create_task(_ingest_corpora(app, qdrant_client, get_embedder(), settings))
+    )
 
     yield
 

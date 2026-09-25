@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir --timeout=120 --retries=5 -r requirements.lock \
 
 COPY app ./app
 COPY scripts ./scripts
+COPY benchmarks ./benchmarks
 COPY data/corpus ./data/corpus
 
 EXPOSE 8000
