@@ -11,7 +11,9 @@ services:
     env_file: ../.env
     depends_on: [qdrant]
     ports: ["8000:8000"]
-    volumes: ["app_data:/data"]
+    volumes:
+      - app_data:/data
+      - ../data/corpus:/app/data/corpus:ro
 
 volumes:
   qdrant_data:
