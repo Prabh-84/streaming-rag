@@ -243,6 +243,94 @@ async def test_final_chunk_uses_final_trigger(session, retriever, embedder, sett
     assert retriever.calls[0].trigger == RetrievalTrigger.FINAL
 
 
+# --- manual/single-shot input: a session's first-and-only chunk marked is_final ------------------
+#
+# The manual free-text path (frontend DemoControls.sendManual) sends exactly one TranscriptChunk
+# with is_final=True and nothing else ever follows. Before the controller's is_final-aware
+# bypass, compute_stability structurally returns 0.0 for a lone chunk (fewer than
+# STABILITY_WINDOW embeddings to compare), which always read as "unstable" and permanently WAITed
+# - the manual question could never reach retrieval. These use the REAL (non-monkeypatched)
+# compute_stability, since the whole point is proving the fix works against the actual insufficient
+# -history condition, not a mocked stability value.
+
+
+async def test_single_final_chunk_with_entity_retrieves_immediately(
+    session, retriever, embedder, settings
+):
+    """The exact manual-input bug: one chunk, is_final=True, a real actionable entity - must
+    retrieve on the first and only chunk, without needing a second chunk to prove stability."""
+    decision = await run_chunk(
+        session,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+        is_final=True,
+    )
+    assert decision.decision == ctrl.RETRIEVE
+    assert decision.trigger == RetrievalTrigger.FINAL
+    assert len(retriever.calls) == 1
+
+
+async def test_single_non_final_chunk_with_entity_still_waits(
+    session, retriever, embedder, settings
+):
+    """Regression guard: the SAME text without is_final must still WAIT exactly as before - the
+    bypass is tied strictly to is_final, never to "first chunk with an entity" in general, so a
+    real streaming transcript's ordinary provisional first chunk is completely unaffected."""
+    decision = await run_chunk(
+        session,
+        "Orion Hall for 30 guests",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+        is_final=False,
+    )
+    assert decision.decision == ctrl.WAIT
+    assert decision.reason == "intent_unstable"
+    assert retriever.calls == []
+
+
+async def test_single_final_chunk_without_entity_still_waits(
+    session, retriever, embedder, settings
+):
+    """is_final bypasses only the missing-stability-history gate, never the actionable-entity
+    requirement - a final chunk carrying no recognizable domain entity still WAITs."""
+    decision = await run_chunk(
+        session, "hello there", 0, retriever=retriever, embedder=embedder, settings=settings,
+        is_final=True,
+    )
+    assert decision.decision == ctrl.WAIT
+    assert decision.reason == "intent_unstable"
+    assert retriever.calls == []
+
+
+async def test_final_chunk_bypass_never_applies_once_history_is_sufficient(
+    session, retriever, embedder, settings
+):
+    """Once a session already has STABILITY_WINDOW embeddings, a later is_final chunk gets no
+    special treatment - a genuinely unstable real transcript's final chunk still WAITs, proving
+    the bypass cannot fire beyond a session's very first chunk (REQ-CTRL-01 unchanged for real
+    multi-chunk streaming)."""
+    await run_chunk(
+        session, "completely unrelated filler", 0, retriever=retriever, embedder=embedder,
+        settings=settings,
+    )
+    decision = await run_chunk(
+        session,
+        "totally different topic entirely",
+        400,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
+        is_final=True,
+    )
+    assert decision.decision == ctrl.WAIT
+    assert retriever.calls == []
+
+
 async def test_early_retrieval_before_final_transcript_completion(
     session, retriever, embedder, settings, monkeypatch
 ):

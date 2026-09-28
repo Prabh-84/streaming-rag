@@ -165,7 +165,18 @@ async def on_chunk(
         # never retrieved before - a fresh multi-intent decomposition over the whole buffer.
 
     stability = compute_stability(session.embedding_history, settings.stability_window)
-    if stability < settings.stability_threshold or not delta:
+    # A chunk explicitly marked is_final (REQ-STREAM-01's own "this utterance is complete"
+    # signal) that hasn't yet accumulated STABILITY_WINDOW embeddings can't be judged unstable by
+    # compute_stability - it structurally returns 0.0 for "not enough history yet" (see its
+    # docstring), not a real instability reading. A manually-typed single-shot question is exactly
+    # this case: exactly one chunk, is_final=True, nothing more ever arrives to build history with.
+    # This can only ever fire on a session's very first chunk (embedding_history only grows), so a
+    # real multi-chunk transcript's eventual final chunk - which by then already has a genuine
+    # stability reading from its preceding chunks - is completely unaffected; an unstable real
+    # final chunk still WAITs exactly as before.
+    insufficient_history = len(session.embedding_history) < settings.stability_window
+    conclusive_single_chunk = chunk.is_final and insufficient_history
+    if not delta or (stability < settings.stability_threshold and not conclusive_single_chunk):
         session.wait_count += 1
         if session.wait_count > settings.max_wait_chunks:
             session.wait_count = 0
