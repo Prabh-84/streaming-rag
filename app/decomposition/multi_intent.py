@@ -12,8 +12,8 @@ pair whose cosine exceeds MERGE_THRESHOLD is merged into one, preventing pitfall
 (over-fragmentation). If the LLM call fails, times out, or returns nothing usable, the whole
 transcript is used as a single fallback sub-query rather than dropping the turn.
 
-The LLM behind structured decomposition is swappable via LLM_PROVIDER (anthropic | gemini,
-default anthropic) — both implementations satisfy the same DecompositionLLM protocol and must
+The LLM behind structured decomposition is swappable via LLM_PROVIDER (anthropic | gemini | groq,
+default anthropic) — all three implementations satisfy the same DecompositionLLM protocol and must
 produce the identical {"sub_queries": [{"text", "intent_label"}, ...]} shape before it ever
 reaches _validate_proposed(); everything downstream of that call (validation, merge, fallback,
 retrieval) is provider-agnostic.
@@ -239,7 +239,105 @@ class GeminiDecomposer:
             return None
 
 
-_PROVIDERS = {"anthropic", "gemini"}
+# additionalProperties:false + every field required on every object: Groq's Structured Outputs
+# strict:true mode (constrained decoding) requires this shape; otherwise identical to
+# _DECOMPOSE_TOOL_SCHEMA["input_schema"] above, so _validate_proposed() sees the same
+# {"sub_queries": [{"text", "intent_label"}, ...]} result regardless of provider.
+_GROQ_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "sub_queries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "One independent, self-contained sub-question.",
+                    },
+                    "intent_label": {
+                        "type": "string",
+                        "description": "A short (1-3 word) label for this sub-question's topic.",
+                    },
+                },
+                "required": ["text", "intent_label"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["sub_queries"],
+    "additionalProperties": False,
+}
+
+
+class GroqDecomposer:
+    """Wraps the configured Groq model behind DecompositionLLM via Groq's OpenAI-compatible Chat
+    Completions REST API, using Structured Outputs strict JSON-schema mode (response_format:
+    json_schema, strict: true) so the model is constrained at the token level to the exact
+    {"sub_queries": [...]} shape - the same guarantee GeminiDecomposer gets from response_schema.
+    No provider SDK needed: httpx (already required transitively by anthropic/google-genai) calls
+    the REST endpoint directly, same lazy-client pattern as AnthropicDecomposer/GeminiDecomposer."""
+
+    _URL = "https://api.groq.com/openai/v1/chat/completions"
+
+    def __init__(self, api_key: str, model: str) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._client: Any = None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            import httpx
+
+            self._client = httpx.AsyncClient()
+        return self._client
+
+    async def decompose(self, transcript: str, *, timeout_ms: int) -> Any:
+        import json
+
+        client = self._get_client()
+        payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": _DECOMPOSE_SYSTEM_PROMPT},
+                {"role": "user", "content": transcript},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": DECOMPOSE_TOOL_NAME,
+                    "strict": True,
+                    "schema": _GROQ_JSON_SCHEMA,
+                },
+            },
+            "stream": False,
+        }
+        response = await client.post(
+            self._URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            # Transport-level timeout as a second line of defense, same reasoning as
+            # AnthropicDecomposer.decompose(); decompose() below is the authoritative enforcement
+            # point. Groq's REST API has no minimum-deadline floor (unlike Gemini), so no clamping
+            # is needed here.
+            timeout=timeout_ms / 1000,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"{response.status_code} {response.reason_phrase}: {response.text}")
+        body = response.json()
+        content = body["choices"][0]["message"]["content"]
+        if not content:
+            return None
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return None
+
+
+_PROVIDERS = {"anthropic", "gemini", "groq"}
 
 
 @lru_cache(maxsize=1)
@@ -249,6 +347,8 @@ def get_decomposer() -> DecompositionLLM:
         return GeminiDecomposer(settings.gemini_api_key, settings.gemini_model)
     if settings.llm_provider == "anthropic":
         return AnthropicDecomposer(settings.anthropic_api_key, settings.llm_model)
+    if settings.llm_provider == "groq":
+        return GroqDecomposer(settings.groq_api_key, settings.groq_model)
     raise ValueError(
         f"Unknown LLM_PROVIDER {settings.llm_provider!r}; expected one of {sorted(_PROVIDERS)}"
     )

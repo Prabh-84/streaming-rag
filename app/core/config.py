@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     # --- Secrets / external services ---
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     api_key: str = Field(default="change_me_local_dev", alias="API_KEY")
     eval_key: str = Field(default="change_me_eval", alias="EVAL_KEY")
 
@@ -28,9 +29,14 @@ class Settings(BaseSettings):
     reranker_model: str = Field(
         default="cross-encoder/ms-marco-MiniLM-L-6-v2", alias="RERANKER_MODEL"
     )
-    llm_provider: str = Field(default="anthropic", alias="LLM_PROVIDER")  # anthropic | gemini
+    # anthropic | gemini | groq
+    llm_provider: str = Field(default="anthropic", alias="LLM_PROVIDER")
     llm_model: str = Field(default="claude-sonnet-5", alias="LLM_MODEL")
     gemini_model: str = Field(default="gemini-3.6-flash", alias="GEMINI_MODEL")
+    # openai/gpt-oss-120b: one of only two Groq production models with Structured Outputs
+    # strict:true (constrained-decoding JSON schema) support, needed for multi-intent
+    # decomposition's structured output (console.groq.com/docs/structured-outputs, Sept 2026).
+    groq_model: str = Field(default="openai/gpt-oss-120b", alias="GROQ_MODEL")
     spacy_model: str = Field(default="en_core_web_sm", alias="SPACY_MODEL")
 
     # --- Corpus / data locations (REQ-CORPUS-01, REQ-CORPUS-02) ---

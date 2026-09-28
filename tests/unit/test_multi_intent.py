@@ -500,9 +500,131 @@ async def test_gemini_decomposer_output_flows_through_full_decompose_pipeline(
     assert {sq.intent_label for sq in sub_queries} == {"cancellation", "catering"}
 
 
+# --- H. Provider configuration (Groq) --------------------------------------------------------
+#
+# GroqDecomposer talks to the real network only via httpx.AsyncClient.post (no provider SDK -
+# Groq's OpenAI-compatible REST API is called directly), so these tests fake that one seam rather
+# than mocking DecompositionLLM itself - the only place the Groq-specific request/response shape
+# (response_format: json_schema/strict, choices[0].message.content as a JSON string) is exercised.
+# The real, unmocked network path is covered separately by the live E2E validation.
+
+
+def _fake_groq_client_cls(status_code: int = 200, content: str | None = "", body_text: str = ""):
+    """A stand-in for httpx.AsyncClient whose .post(...) returns a fake httpx.Response-shaped
+    object. `content` is the JSON string placed at choices[0].message.content (None omits the key
+    entirely, matching an empty/absent completion)."""
+    from types import SimpleNamespace
+
+    calls: list[dict] = []
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.status_code = status_code
+            self.reason_phrase = "OK" if status_code < 400 else "Error"
+            self.text = body_text
+
+        def json(self) -> dict:
+            # OpenAI-compatible shape: content is always present, null rather than omitted.
+            return {"choices": [{"message": {"content": content}}]}
+
+    class _FakeAsyncClient:
+        calls_ref = calls
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def post(self, url: str, **kwargs: object) -> SimpleNamespace:
+            calls.append({"url": url, **kwargs})
+            return _FakeResponse()
+
+    return _FakeAsyncClient
+
+
+async def test_groq_decomposer_parses_valid_structured_json(monkeypatch):
+    from app.decomposition.multi_intent import GroqDecomposer
+
+    fake_cls = _fake_groq_client_cls(
+        content='{"sub_queries": [{"text": "a", "intent_label": "x"}, '
+        '{"text": "b", "intent_label": "y"}]}'
+    )
+    monkeypatch.setattr("httpx.AsyncClient", fake_cls)
+
+    llm = GroqDecomposer(api_key="fake-key", model="openai/gpt-oss-120b")
+    result = await llm.decompose("some transcript", timeout_ms=15_000)
+
+    assert result == {
+        "sub_queries": [
+            {"text": "a", "intent_label": "x"},
+            {"text": "b", "intent_label": "y"},
+        ]
+    }
+    (call,) = fake_cls.calls_ref
+    assert call["json"]["model"] == "openai/gpt-oss-120b"
+    assert call["json"]["messages"][-1] == {"role": "user", "content": "some transcript"}
+    response_format = call["json"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["sub_queries"]["items"]["additionalProperties"] is False
+    assert call["timeout"] == 15.0  # timeout_ms/1000, same "second line of defense" as Anthropic
+
+
+async def test_groq_decomposer_returns_none_on_invalid_json(monkeypatch):
+    from app.decomposition.multi_intent import GroqDecomposer
+
+    monkeypatch.setattr("httpx.AsyncClient", _fake_groq_client_cls(content="not valid json"))
+    llm = GroqDecomposer(api_key="fake-key", model="openai/gpt-oss-120b")
+    assert await llm.decompose("x", timeout_ms=1500) is None
+
+
+async def test_groq_decomposer_returns_none_on_empty_response(monkeypatch):
+    from app.decomposition.multi_intent import GroqDecomposer
+
+    monkeypatch.setattr("httpx.AsyncClient", _fake_groq_client_cls(content=None))
+    llm = GroqDecomposer(api_key="fake-key", model="openai/gpt-oss-120b")
+    assert await llm.decompose("x", timeout_ms=1500) is None
+
+
+async def test_groq_decomposer_raises_on_http_error_status(monkeypatch):
+    """A non-2xx response (e.g. 429 rate limit) must raise, not silently return None - the
+    orchestrator's decompose() is what turns a raised error into a fallback + ERROR event."""
+    from app.decomposition.multi_intent import GroqDecomposer
+
+    monkeypatch.setattr(
+        "httpx.AsyncClient", _fake_groq_client_cls(status_code=429, body_text="rate limited")
+    )
+    llm = GroqDecomposer(api_key="fake-key", model="openai/gpt-oss-120b")
+    with pytest.raises(RuntimeError, match="429"):
+        await llm.decompose("x", timeout_ms=1500)
+
+
+async def test_groq_decomposer_output_flows_through_full_decompose_pipeline(monkeypatch, settings):
+    """The Groq path, exercised through the same decompose() orchestrator the Anthropic/Gemini
+    paths use - proves the provider swap didn't change the compound-signal gate, validation, or
+    anti-fragmentation merge behavior downstream of the LLM call."""
+    from app.decomposition.multi_intent import GroqDecomposer
+
+    fake_cls = _fake_groq_client_cls(
+        content='{"sub_queries": ['
+        '{"text": "What is the cancellation policy for Orion Hall?", '
+        '"intent_label": "cancellation"}, '
+        '{"text": "What are the catering options for Orion Hall?", "intent_label": "catering"}'
+        "]}"
+    )
+    monkeypatch.setattr("httpx.AsyncClient", fake_cls)
+    llm = GroqDecomposer(api_key="fake-key", model="openai/gpt-oss-120b")
+
+    sub_queries = await decompose(
+        COMPOUND_TEXT, "alpha", "sess_1", 0, trace_id="trc_1", llm=llm, settings=settings
+    )
+    assert len(sub_queries) == 2
+    assert {sq.intent_label for sq in sub_queries} == {"cancellation", "catering"}
+
+
 def test_get_decomposer_dispatches_on_llm_provider(monkeypatch, tmp_path):
     from app.decomposition import multi_intent
-    from app.decomposition.multi_intent import AnthropicDecomposer, GeminiDecomposer
+    from app.decomposition.multi_intent import AnthropicDecomposer, GeminiDecomposer, GroqDecomposer
 
     anthropic_settings = make_settings(
         FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="k", LLM_MODEL="m"
@@ -517,6 +639,13 @@ def test_get_decomposer_dispatches_on_llm_provider(monkeypatch, tmp_path):
     monkeypatch.setattr(multi_intent, "get_settings", lambda: gemini_settings)
     multi_intent.get_decomposer.cache_clear()
     assert isinstance(multi_intent.get_decomposer(), GeminiDecomposer)
+
+    groq_settings = make_settings(
+        FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="groq", GROQ_API_KEY="k", GROQ_MODEL="g"
+    )
+    monkeypatch.setattr(multi_intent, "get_settings", lambda: groq_settings)
+    multi_intent.get_decomposer.cache_clear()
+    assert isinstance(multi_intent.get_decomposer(), GroqDecomposer)
 
     multi_intent.get_decomposer.cache_clear()  # never leak a cached instance into other tests
 

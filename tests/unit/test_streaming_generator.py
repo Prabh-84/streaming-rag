@@ -475,3 +475,197 @@ async def test_no_sub_queries_produces_no_answer(session, settings):
     answer = await stream_answer(session, [], [], [], trace_id="t1", llm=llm, settings=settings)
     assert answer is None
     assert llm.stream_calls == []
+
+
+# --- 10. Provider configuration (Groq) -------------------------------------------------------
+#
+# GroqGenerator talks to the real network only via httpx.AsyncClient (no provider SDK - Groq's
+# OpenAI-compatible REST API is called directly), so these tests fake that one seam rather than
+# mocking GenerationLLM itself - the only place the Groq-specific request/response shape
+# (SSE "data: {...}" chunks, choices[0].delta.content / choices[0].message.content) is exercised.
+# The real, unmocked network path is covered separately by the live E2E validation.
+
+
+def _fake_groq_complete_client_cls(
+    status_code: int = 200, message_content: str = "", text: str = ""
+):
+    calls: list[dict] = []
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.status_code = status_code
+            self.reason_phrase = "OK" if status_code < 400 else "Error"
+            self.text = text
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": message_content}}]}
+
+    class _FakeAsyncClient:
+        calls_ref = calls
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def post(self, url: str, **kwargs: object) -> _FakeResponse:
+            calls.append({"url": url, **kwargs})
+            return _FakeResponse()
+
+    return _FakeAsyncClient
+
+
+def _fake_groq_stream_client_cls(status_code: int = 200, sse_lines: list[str] | None = None):
+    calls: list[dict] = []
+    lines = sse_lines if sse_lines is not None else []
+
+    class _FakeStreamResponse:
+        def __init__(self) -> None:
+            self.status_code = status_code
+            self.reason_phrase = "OK" if status_code < 400 else "Error"
+
+        async def __aenter__(self) -> _FakeStreamResponse:
+            return self
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+        async def aread(self) -> bytes:
+            return b"stream error body"
+
+        async def aiter_lines(self):
+            for line in lines:
+                yield line
+
+    class _FakeAsyncClient:
+        calls_ref = calls
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def stream(self, method: str, url: str, **kwargs: object) -> _FakeStreamResponse:
+            calls.append({"method": method, "url": url, **kwargs})
+            return _FakeStreamResponse()
+
+    return _FakeAsyncClient
+
+
+async def test_groq_generator_complete_returns_message_content(monkeypatch):
+    from app.generation.streaming_generator import GroqGenerator
+
+    fake_cls = _fake_groq_complete_client_cls(message_content="the completed sentence")
+    monkeypatch.setattr("httpx.AsyncClient", fake_cls)
+
+    llm = GroqGenerator(api_key="fake-key", model="openai/gpt-oss-120b")
+    result = await llm.complete("system prompt", "user prompt")
+
+    assert result == "the completed sentence"
+    (call,) = fake_cls.calls_ref
+    assert call["json"]["model"] == "openai/gpt-oss-120b"
+    assert call["json"]["stream"] is False
+    assert call["json"]["messages"] == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "user prompt"},
+    ]
+
+
+async def test_groq_generator_complete_raises_on_http_error(monkeypatch):
+    from app.generation.streaming_generator import GroqGenerator
+
+    monkeypatch.setattr(
+        "httpx.AsyncClient",
+        _fake_groq_complete_client_cls(status_code=429, text="rate limited"),
+    )
+    llm = GroqGenerator(api_key="fake-key", model="openai/gpt-oss-120b")
+    with pytest.raises(RuntimeError, match="429"):
+        await llm.complete("system", "prompt")
+
+
+async def test_groq_generator_stream_yields_delta_content_chunks(monkeypatch):
+    from app.generation.streaming_generator import GroqGenerator
+
+    sse_lines = [
+        'data: {"choices": [{"delta": {"content": "Hello"}}]}',
+        'data: {"choices": [{"delta": {"content": " world"}}]}',
+        "data: [DONE]",
+    ]
+    monkeypatch.setattr("httpx.AsyncClient", _fake_groq_stream_client_cls(sse_lines=sse_lines))
+
+    llm = GroqGenerator(api_key="fake-key", model="openai/gpt-oss-120b")
+    tokens = [t async for t in llm.stream("system", "prompt")]
+
+    assert tokens == ["Hello", " world"]
+
+
+async def test_groq_generator_stream_raises_on_http_error(monkeypatch):
+    from app.generation.streaming_generator import GroqGenerator
+
+    monkeypatch.setattr(
+        "httpx.AsyncClient", _fake_groq_stream_client_cls(status_code=429, sse_lines=[])
+    )
+    llm = GroqGenerator(api_key="fake-key", model="openai/gpt-oss-120b")
+    with pytest.raises(RuntimeError, match="429"):
+        async for _ in llm.stream("system", "prompt"):
+            pass
+
+
+async def test_groq_generator_output_flows_through_full_stream_answer_pipeline(session, settings):
+    """The Groq path, exercised through stream_answer() directly with a fake GenerationLLM (the
+    citation-validation/grounding pipeline downstream of the LLM call is provider-agnostic, same
+    as every other provider's coverage above) - GroqGenerator's own request/response shape is
+    covered by the mocked-transport tests above."""
+    sub_queries = [_sub_query("What is the cancellation policy for Orion Hall?")]
+    evidence = [_evidence("sq1", CHUNK_CANCEL.chunk_id)]
+    retrievals = [_retrieval_result("sq1", [CHUNK_CANCEL])]
+    llm = FakeGenerationLLM(
+        chunks=[f"Orion Hall requires 14 days notice for a refund {CANCEL_TAG}."]
+    )
+
+    answer = await stream_answer(
+        session, sub_queries, evidence, retrievals, trace_id="t1", llm=llm, settings=settings
+    )
+    assert answer is not None
+    assert len(answer.citations) == 1
+
+
+def test_get_generator_dispatches_on_llm_provider(monkeypatch, tmp_path):
+    from app.generation import streaming_generator
+    from app.generation.streaming_generator import (
+        AnthropicGenerator,
+        GeminiGenerator,
+        GroqGenerator,
+    )
+    from tests.fakes import FIXTURE_CORPORA, make_settings
+
+    anthropic_settings = make_settings(
+        FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="k", LLM_MODEL="m"
+    )
+    monkeypatch.setattr(streaming_generator, "get_settings", lambda: anthropic_settings)
+    streaming_generator.get_generator.cache_clear()
+    assert isinstance(streaming_generator.get_generator(), AnthropicGenerator)
+
+    gemini_settings = make_settings(
+        FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="gemini", GEMINI_API_KEY="k", GEMINI_MODEL="g"
+    )
+    monkeypatch.setattr(streaming_generator, "get_settings", lambda: gemini_settings)
+    streaming_generator.get_generator.cache_clear()
+    assert isinstance(streaming_generator.get_generator(), GeminiGenerator)
+
+    groq_settings = make_settings(
+        FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="groq", GROQ_API_KEY="k", GROQ_MODEL="g"
+    )
+    monkeypatch.setattr(streaming_generator, "get_settings", lambda: groq_settings)
+    streaming_generator.get_generator.cache_clear()
+    assert isinstance(streaming_generator.get_generator(), GroqGenerator)
+
+    streaming_generator.get_generator.cache_clear()  # never leak a cached instance into other tests
+
+
+def test_get_generator_rejects_unknown_provider(monkeypatch, tmp_path):
+    from app.generation import streaming_generator
+    from tests.fakes import FIXTURE_CORPORA, make_settings
+
+    bad_settings = make_settings(FIXTURE_CORPORA, tmp_path, LLM_PROVIDER="not_a_real_provider")
+    monkeypatch.setattr(streaming_generator, "get_settings", lambda: bad_settings)
+    streaming_generator.get_generator.cache_clear()
+    with pytest.raises(ValueError, match="not_a_real_provider"):
+        streaming_generator.get_generator()
+    streaming_generator.get_generator.cache_clear()

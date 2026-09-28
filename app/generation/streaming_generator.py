@@ -7,9 +7,10 @@ required) -> emit ANSWER_DELTA per sentence, regenerating a failing sentence onc
 ANSWER_VERSION_CREATED once the whole answer is complete.
 
 The generation LLM is swappable via the same LLM_PROVIDER setting Phase 4's decomposer uses
-(anthropic | gemini) - a *different* interface (free-text streaming, not structured tool-use/JSON
-mode), but the same lazy-singleton-per-provider pattern and the same "never trust the provider's
-own timeout" orchestrator-level enforcement (app.decomposition.multi_intent.decompose).
+(anthropic | gemini | groq) - a *different* interface (free-text streaming, not structured
+tool-use/JSON mode), but the same lazy-singleton-per-provider pattern and the same "never trust
+the provider's own timeout" orchestrator-level enforcement
+(app.decomposition.multi_intent.decompose).
 """
 
 from __future__ import annotations
@@ -152,7 +153,71 @@ class GeminiGenerator:
         return response.text or ""
 
 
-_PROVIDERS = {"anthropic", "gemini"}
+class GroqGenerator:
+    """Wraps the configured Groq model behind GenerationLLM via Groq's OpenAI-compatible Chat
+    Completions REST API. No provider SDK needed - httpx is already required transitively by
+    anthropic/google-genai (see requirements.lock), so the REST surface is called directly with
+    the same lazy-client construction pattern as AnthropicGenerator/GeminiGenerator."""
+
+    _URL = "https://api.groq.com/openai/v1/chat/completions"
+
+    def __init__(self, api_key: str, model: str) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._client: Any = None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            import httpx
+
+            self._client = httpx.AsyncClient()
+        return self._client
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+
+    def _messages(self, system: str, prompt: str) -> list[dict[str, str]]:
+        return [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+
+    async def stream(self, system: str, prompt: str) -> AsyncIterator[str]:
+        import json
+
+        client = self._get_client()
+        payload = {"model": self._model, "messages": self._messages(system, prompt), "stream": True}
+        async with client.stream(
+            "POST", self._URL, json=payload, headers=self._headers(), timeout=60.0
+        ) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                detail = body.decode(errors="replace")
+                raise RuntimeError(f"{response.status_code} {response.reason_phrase}: {detail}")
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[len("data: ") :].strip()
+                if not data or data == "[DONE]":
+                    continue
+                chunk = json.loads(data)
+                delta = chunk["choices"][0].get("delta", {})
+                text = delta.get("content")
+                if text:
+                    yield text
+
+    async def complete(self, system: str, prompt: str) -> str:
+        client = self._get_client()
+        payload = {
+            "model": self._model,
+            "messages": self._messages(system, prompt),
+            "stream": False,
+        }
+        response = await client.post(self._URL, json=payload, headers=self._headers(), timeout=60.0)
+        if response.status_code >= 400:
+            raise RuntimeError(f"{response.status_code} {response.reason_phrase}: {response.text}")
+        body = response.json()
+        return body["choices"][0]["message"]["content"] or ""
+
+
+_PROVIDERS = {"anthropic", "gemini", "groq"}
 
 
 @lru_cache(maxsize=1)
@@ -162,6 +227,8 @@ def get_generator() -> GenerationLLM:
         return GeminiGenerator(settings.gemini_api_key, settings.gemini_model)
     if settings.llm_provider == "anthropic":
         return AnthropicGenerator(settings.anthropic_api_key, settings.llm_model)
+    if settings.llm_provider == "groq":
+        return GroqGenerator(settings.groq_api_key, settings.groq_model)
     raise ValueError(
         f"Unknown LLM_PROVIDER {settings.llm_provider!r}; expected one of {sorted(_PROVIDERS)}"
     )
