@@ -16,6 +16,7 @@ from typing import Any
 
 import structlog
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from qdrant_client import AsyncQdrantClient
 
@@ -170,6 +171,17 @@ def _check_qdrant(qdrant_url: str) -> bool:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Streaming Live RAG", version="0.1.0", lifespan=lifespan)
+    # Frontend compatibility only (no route/business-logic change): the browser-based UI is
+    # served from its own origin (Vite dev server / nginx container) and calls these REST
+    # endpoints directly with an explicit Authorization header, never cookies - so a permissive
+    # origin policy carries no credential-leak risk (allow_credentials stays False, the CORS-spec
+    # default, since "credentials" here means cookies/HTTP auth, not an explicit bearer header).
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(session_router.router)
     app.include_router(stream_router.router)
     app.include_router(events_router.router)

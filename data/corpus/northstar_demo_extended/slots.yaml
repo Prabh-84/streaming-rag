@@ -1,0 +1,77 @@
+slots:
+- name: attendance
+  patterns:
+  - attendance
+  - attendance requirement
+  - attendance shortage
+  - attendance waiver
+- name: withdrawal
+  patterns:
+  - course withdrawal
+  - withdraw from a course
+  - withdrawal deadline
+- name: grade_improvement
+  patterns:
+  - grade improvement
+  - improve a grade
+  - repeat a course
+- name: examination
+  patterns:
+  - examination
+  - exam eligibility
+  - re-examination
+  - supplementary examination
+- name: hostel_visitors
+  patterns:
+  - hostel visitor
+  - visitors
+  - overnight visitor
+- name: hostel_leave
+  patterns:
+  - hostel leave
+  - outpass
+  - leave request
+  - overnight leave
+- name: room_change
+  patterns:
+  - room change
+  - change room
+  - room assignment
+- name: late_fee
+  patterns:
+  - late fee
+  - late payment
+  - payment penalty
+- name: scholarship
+  patterns:
+  - scholarship
+  - scholarship renewal
+  - scholarship eligibility
+- name: library
+  patterns:
+  - library
+  - book renewal
+  - library fine
+  - borrowing
+- name: laboratory
+  patterns:
+  - laboratory
+  - lab safety
+  - lab attendance
+  - equipment
+- name: internship
+  patterns:
+  - internship
+  - internship registration
+  - internship report
+- name: placement
+  patterns:
+  - placement
+  - recruitment
+  - placement eligibility
+- name: grievance
+  patterns:
+  - grievance
+  - complaint
+  - appeal
+  - escalation

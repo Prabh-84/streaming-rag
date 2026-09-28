@@ -1,0 +1,58 @@
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid;
+  font-size: 13px;
+  animation: slideIn var(--duration-medium) var(--ease-standard);
+}
+
+.error {
+  background: var(--status-error-bg);
+  border-color: rgba(248, 113, 113, 0.3);
+  color: #ffb4b4;
+}
+
+.warn {
+  background: var(--status-warn-bg);
+  border-color: rgba(251, 191, 36, 0.3);
+  color: #ffd88a;
+}
+
+.info {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: #bcdcff;
+}
+
+.message {
+  flex: 1;
+}
+
+.dismiss {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  color: inherit;
+  opacity: 0.7;
+  padding: var(--space-1);
+}
+
+.dismiss:hover {
+  opacity: 1;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

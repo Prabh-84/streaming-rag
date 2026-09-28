@@ -1,0 +1,76 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0 var(--space-4) var(--space-4);
+  overflow-y: auto;
+}
+
+.empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: var(--space-3) 0;
+}
+
+.chunk {
+  border: 1px solid var(--border-subtle);
+  border-left: 2px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  background: var(--bg-panel);
+  animation: rise var(--duration-medium) var(--ease-standard);
+}
+
+.chunk.active {
+  border-left-color: var(--accent);
+  background: var(--bg-panel-raised);
+}
+
+.chunk.final {
+  border-left-color: var(--status-live);
+}
+
+.chunkMeta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.seq {
+  color: var(--text-secondary);
+}
+
+.finalBadge {
+  margin-left: auto;
+  color: var(--status-live);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.text {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
