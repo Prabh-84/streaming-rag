@@ -1,267 +1,433 @@
 # Streaming Live RAG
 
-A single FastAPI service that answers a user's question **while they are still speaking**. Instead of waiting for a finished utterance, it streams transcript chunks into a deterministic controller that decides, chunk by chunk, whether enough has been said to retrieve — then decomposes compound questions, retrieves from a corpus-scoped hybrid index, fuses and reranks the evidence, and streams back a grounded, cited answer that it can refine in place as later chunks add new constraints.
+A single FastAPI service that retrieves and answers while the user is still speaking — deciding per transcript chunk whether to retrieve, splitting compound requests into independent sub-queries, and refining an existing grounded answer in place when a later chunk adds a new constraint.
 
-Full specification: [`PRD_TRD.md`](PRD_TRD.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/API.md`](docs/API.md), [`docs/TELEMETRY.md`](docs/TELEMETRY.md), [`docs/EVALUATION.md`](docs/EVALUATION.md). Those documents are the frozen source of truth; this file documents what is actually implemented and how to run it.
+Built for the **Samsung PRISM Generative AI Hackathon 3rd Edition 2026–27, Theme 4: Streaming Live RAG**.
 
-## Status
+[![CI](https://github.com/Prabh-84/streaming-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/Prabh-84/streaming-rag/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 
-**Phases 1–10 complete.** Foundation, corpus ingestion, streaming retrieval controller, multi-intent decomposition, evidence fusion/reranking, session refinement, grounded generation with citations, telemetry/observability, the evaluation/benchmark harness, and Docker/deployment are all implemented and tested. `docker compose up --build` is a genuine one-command deployment: it builds the current codebase into an image, starts `app` + `qdrant`, ingests every corpus under `data/corpus/` at startup, warms the embedding/spaCy models, and `/ready` only turns healthy once all of that has actually happened — verified end to end in a real container, including real Qdrant retrieval, reranking, real Gemini generation, grounded citations, telemetry, and session resync.
+Full frozen specification: [`PRD_TRD.md`](PRD_TRD.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/API.md`](docs/API.md), [`docs/TELEMETRY.md`](docs/TELEMETRY.md), [`docs/EVALUATION.md`](docs/EVALUATION.md). This README documents what is **actually implemented and verified** in the current repository, not the aspirational spec.
 
-No production corpus has been supplied yet; see [`data/corpus/README.md`](data/corpus/README.md) for where it goes. A synthetic benchmark corpus used only by the evaluation harness lives separately under `benchmarks/streaming_suite_v1/`.
+## Table of Contents
 
-## 1. Overview and purpose
+- [Overview](#overview)
+- [Why This Matters](#why-this-matters)
+- [Key Capabilities](#key-capabilities)
+- [System Architecture](#system-architecture)
+- [Core Pipeline](#core-pipeline)
+- [Handling Incremental / Late Information](#handling-incremental--late-information)
+- [Multi-Intent Example](#multi-intent-example)
+- [Grounding and Citation Safety](#grounding-and-citation-safety)
+- [Corpus Isolation](#corpus-isolation)
+- [Observability](#observability)
+- [Evaluation](#evaluation)
+- [Ablation Studies](#ablation-studies)
+- [Performance / Metrics](#performance--metrics)
+- [Tech Stack](#tech-stack)
+- [Repository Structure](#repository-structure)
+- [Quick Start](#quick-start)
+- [API / WebSocket](#api--websocket)
+- [Configuration](#configuration)
+- [Testing](#testing)
+- [Reproducibility](#reproducibility)
+- [Design Decisions](#design-decisions)
+- [Limitations](#limitations)
+- [Security / Privacy](#security--privacy)
+- [Hackathon Alignment](#hackathon-alignment)
+- [Submission Checklist](#submission-checklist)
+- [License](#license)
 
-Real conversational assistants that wait for a full utterance before doing anything pay a latency tax the user can feel. Streaming Live RAG's premise is that a live transcript already carries enough signal — a stabilizing embedding, a resolved entity — to start retrieval before the speaker finishes, without either retrieving on every noisy partial chunk or fabricating an answer from incomplete evidence.
+## Overview
 
-The system is one deterministic FastAPI process (no agent orchestration, no multi-service fan-out beyond the vector store) that, per conversational turn:
+Batch RAG waits for a complete utterance, treats every turn as fresh, and discards verified work the moment a user corrects themselves. That model breaks down in a live conversational setting: users speak incrementally, one utterance can carry several distinct questions, important constraints ("...for 30 guests" / "...specifically for the library, not the hostel") often arrive after the main request, and a system that restarts its whole pipeline on every such addition feels slow and forgetful.
 
-1. Decides whether a transcript chunk is stable and specific enough to retrieve for.
-2. Splits a compound request ("the cancellation policy **and** the catering options") into independent sub-queries.
-3. Retrieves from a single, corpus-scoped hybrid (dense + sparse) index, fuses and reranks the results, and flags any conflicting evidence.
-4. Synthesizes a streamed, sentence-by-sentence answer in which every factual sentence carries a citation traceable to a real retrieved chunk — with a deterministic validator that regenerates or replaces any sentence that would fabricate one.
-5. Refines that answer in place — rather than restarting — when a later chunk adds a genuine new constraint to an already-established topic.
-6. Logs every stage transition as a structured `TelemetryEvent`, replayable per session or per pipeline turn.
+Streaming Live RAG is one deterministic FastAPI process that retrieves while the user is still speaking when the transcript is stable and specific enough to justify it, decomposes a compound request into independently searchable sub-questions, retrieves and fuses evidence for each, and streams back a grounded answer whose every factual sentence is validated against a real corpus citation. A later chunk that adds a genuine new constraint to an already-established topic refines that answer with a delta-only retrieval, rather than re-running the full pipeline from scratch.
 
-## 2. Architecture / pipeline
+## Why This Matters
 
-```text
-Client: transcript chunks
-   │  TRANSCRIPT_CHUNK (WS, query-token auth)
-   ▼
-Retrieval Controller ──WAIT────────────────────▶ (loop: wait for more chunks)
-   │
-   ├──NO_RETRIEVAL (presentation-only follow-up)──▶ reuse existing answer, no retrieval
-   │
-   ├──delta on an established topic──▶ Session Refinement classifier
-   │        │                              │
-   │        │                new_topic ────┘ (falls through to a fresh RETRIEVE below)
-   │        │                refinement ──▶ Multi-Intent Decomposer, scoped to the delta only
-   │        │                ambiguous ──▶ NO_RETRIEVAL (never guesses)
-   │        ▼
-   └──RETRIEVE (provisional / final / forced-after-max-wait)──▶ Multi-Intent Decomposer
-                                                                      │  SubQuery × N (parallel)
-                                                                      ▼
-                                                          Hybrid Retriever (dense + sparse, per corpus_id)
-                                                                      ▼
-                                                          Evidence Fusion (RRF + dedup + contradiction flag)
-                                                                      ▼
-                                                          Cross-Encoder Reranker (+ global evidence cap)
-                                                                      ▼
-                                                          Grounding Validator (citation-tag check + entailment)
-                                                                      ▼
-                                                          Streaming Generator (sentence-by-sentence, cited)
-                                                                      ▼
-                                                          Streamed answer + citations (ANSWER_DELTA, ANSWER_VERSION_CREATED)
+The engineering problem is not "do RAG" — it is deciding, under partial information, *when* to search, *how many* independent questions are actually being asked, and *what to keep* from prior work when the user isn't finished talking. Get retrieval timing wrong and you either search on every noisy half-sentence (wasted latency, garbage queries) or wait for a full stop and lose the latency advantage entirely. Get decomposition wrong and a compound question collapses into one over-broad query or fragments into near-duplicates. Get refinement wrong and every correction throws away already-verified evidence and citations.
 
-Every stage ──▶ Telemetry Event Log (async queue, batched SQLite writer, GET /session/{id}/events)
-Hybrid Retriever ◀──▶ Qdrant (corpus_id-filtered vector store)
-Hybrid Retriever ◀──▶ BM25 sparse index (one pickle per corpus_id)
+This project's answer is a small set of deterministic, independently testable stages — not an LLM-driven agent loop deciding each of these things by prompt — so every decision is auditable from its own telemetry event, not inferred from generated text.
+
+## Key Capabilities
+
+| Capability | What it does |
+|---|---|
+| **Early Retrieval** | Retrieval can start before the transcript is marked final, once the last two chunks' embeddings are stable *and* a concrete corpus entity has been resolved — stability alone never fires it. |
+| **Retrieval Controller** | Per-chunk `WAIT` / `RETRIEVE` / `NO_RETRIEVAL` decision machine, with a forced decision after `MAX_WAIT_CHUNKS` of ambiguity. |
+| **Multi-Intent Decomposition** | A deterministic spaCy dependency-parse check gates a structured LLM call that splits a compound utterance into independent sub-queries; near-duplicate sub-queries are merged by embedding similarity. |
+| **Hybrid Retrieval** | Dense (Qdrant, `bge-small-en-v1.5`) and sparse (BM25) search run concurrently per sub-query, scoped to one `corpus_id`. |
+| **Evidence Fusion** | Reciprocal Rank Fusion + deduplication + contradiction-pair flagging across all sub-queries in a turn. |
+| **Reranking** | Cross-encoder reranking per sub-query, with a global evidence cap that guarantees every sub-intent keeps at least one citable chunk. |
+| **Session Refinement** | A late chunk on an established topic is classified `refinement` / `new_topic` / `ambiguous`; a refinement retrieves only for the delta, never the whole buffer again. |
+| **Grounding & Citation Validation** | Every citation tag is checked against that turn's real evidence set by construction — a tag pointing nowhere is regenerated once, then replaced with an explicit uncertainty statement. |
+| **Streaming Answers** | Sentence-by-sentence generation and validation, delivered as `ANSWER_DELTA` events as they're produced. |
+| **Uncertainty Handling** | Insufficient or unsupported evidence produces an explicit uncertainty statement instead of a guess. |
+| **Telemetry & Observability** | Every stage transition is a structured, replayable `TelemetryEvent`, written through a non-blocking async queue. |
+| **Session Resync** | A WebSocket reconnect emits one `SESSION_RESYNC` event with the latest answer version and entity state before resuming — no chunk replay. |
+| **Corpus Isolation** | Every retrieval call — dense and sparse — is scoped to the session's own `corpus_id`; enforced from ingestion through the vector-store payload filter. |
+
+## System Architecture
+
+```mermaid
+flowchart TD
+    A["Client: TRANSCRIPT_CHUNK frames<br/>(WS, query-token auth)"] --> B["Session Buffer<br/>(ordering / reorder window)"]
+    B --> C{"Retrieval Controller"}
+    C -->|WAIT| B
+    C -->|"NO_RETRIEVAL<br/>(presentation-only)"| Z1["Reuse existing answer"]
+    C -->|"delta on established topic"| D{"Session Refinement<br/>classifier"}
+    D -->|new_topic| E
+    D -->|refinement| F["Multi-Intent Decomposer<br/>(scoped to delta only)"]
+    D -->|ambiguous| Z2["NO_RETRIEVAL<br/>(never guesses)"]
+    C -->|"RETRIEVE<br/>(provisional / final / forced)"| E["Multi-Intent Decomposer"]
+    F --> G
+    E --> G["Parallel Sub-Queries"]
+    G --> H["Hybrid Retriever"]
+    H --> H1["Dense: Qdrant"]
+    H --> H2["Sparse: BM25"]
+    H1 --> I["RRF Fusion + Dedup +<br/>Contradiction Flagging"]
+    H2 --> I
+    I --> J["Cross-Encoder Reranker<br/>+ Global Evidence Cap"]
+    J --> K["Grounding Validator<br/>(citation check + entailment)"]
+    K --> L["Streaming Generator<br/>(sentence-by-sentence)"]
+    L --> M["Answer + Citations<br/>(ANSWER_DELTA / ANSWER_VERSION_CREATED)"]
+
+    N[("Telemetry Event Log<br/>async queue → SQLite")]
+    C -.-> N
+    E -.-> N
+    H -.-> N
+    J -.-> N
+    K -.-> N
+    L -.-> N
 ```
 
-Session Refinement is a controller-level classification (`app/session/delta_engine.py`), not a separate pipeline stage after generation: once a session has an established topic, a later chunk that changes an entity is classified as `refinement` (same topic, new constraint — only the delta is retrieved for), `new_topic` (falls back to a full fresh turn), or `ambiguous` (the controller never guesses; it asks rather than retrieving on a coin flip).
+An optional React frontend (`frontend/`) and a benchmark harness (`benchmarks/`) sit outside this diagram as clients of the same REST/WebSocket API — neither is part of the pipeline itself.
 
-## 3. Capabilities implemented (Phases 1–10)
+## Core Pipeline
 
-| Phase | Capability |
+### 1. Streaming Input
+Inbound `TRANSCRIPT_CHUNK` frames (`seq`, `text_delta`, `t_offset_ms`, `is_final`) are committed into a per-session ordered buffer that resolves out-of-order arrivals within a configurable reorder window before falling through as-is. Implemented in `SessionRecord.ingest_chunk` (`app/session/session_store.py`).
+
+### 2. Retrieval Controller
+For each newly committed chunk, `app/controller/retrieval_controller.py` embeds the chunk, extracts corpus-slot entities (`app/controller/entity_extraction.py`), and computes the average pairwise cosine similarity over the last `STABILITY_WINDOW` chunk embeddings. Retrieval only fires on the conjunction of stability **and** a resolved entity — never on stability alone. A chunk explicitly marked `is_final` with too little history to judge stability (a session's first and only chunk — e.g. a manually typed, complete question) is treated as conclusive rather than unstable, without weakening the stability rule for genuine multi-chunk streaming.
+
+### 3. Early Retrieval
+Because the controller can fire on a non-final chunk (`trigger=provisional`), retrieval can start strictly before the utterance's final chunk arrives. `RETRIEVAL_STARTED.t_offset_ms` is emitted with the real chunk offset that triggered it, so early retrieval is verifiable from telemetry rather than asserted.
+
+### 4. Multi-Intent Decomposition
+`app/decomposition/multi_intent.py` first checks a cheap, deterministic signal — a coordinating conjunction joining two noun phrases bound to different corpus slots (spaCy dependency parse) — before ever calling an LLM. Only a genuine compound signal triggers a structured decomposition call (Anthropic, Gemini, or Groq); proposed sub-queries whose embeddings are near-duplicates (cosine > `MERGE_THRESHOLD`) are merged. An LLM failure or empty result falls back to one whole-transcript sub-query rather than dropping the turn.
+
+### 5. Hybrid Retrieval
+`app/retrieval/hybrid.py` runs dense (Qdrant, `bge-small-en-v1.5`) and sparse (BM25, `app/retrieval/sparse_bm25.py`) search concurrently per sub-query, both scoped to the session's `corpus_id`; all sub-queries in a turn run concurrently, bounded by a semaphore.
+
+### 6. Evidence Fusion
+`app/retrieval/fusion.py` applies Reciprocal Rank Fusion across dense+sparse results, deduplicates near-identical chunks (cosine above `DEDUP_THRESHOLD`, higher-scoring instance kept), and flags chunks addressing the same entity/attribute with materially different values as a contradiction pair rather than silently picking one.
+
+### 7. Reranking
+`app/reranking/cross_encoder.py` scores each sub-query against its deduped candidates with `cross-encoder/ms-marco-MiniLM-L-6-v2`, keeps the top `FINAL_K` per sub-query above `MIN_RELEVANCE`, then `cap_global_evidence` merges everyone's kept list into a global cap (`MAX_TOTAL_EVIDENCE`) while guaranteeing every contributing sub-query keeps at least one chunk.
+
+### 8. Session Refinement
+`app/session/delta_engine.py` classifies a later chunk on an already-established topic as `refinement` (same topic, new constraint — cosine similarity above `REFINEMENT_THRESHOLD` or a contrastive marker like "actually"/"instead"), `new_topic` (falls through to a fresh full turn), or `ambiguous` (returns `NO_RETRIEVAL` rather than guessing). A refinement retrieves only for the delta entities, reusing the same decomposition/retrieval/fusion/reranking machinery as a fresh turn.
+
+### 9. Grounding Validation
+`app/grounding/citation_validator.py` is purely deterministic: it parses every `[doc_id section]` tag out of a generated sentence and checks it resolves to a chunk in that turn's own evidence set. A tag that doesn't resolve is fabrication; a factual-looking sentence with no tag at all is `missing_citation`; a citation whose chunk text doesn't lexically support the sentence is `low_entailment`. Any of these triggers exactly one regeneration attempt; a sentence that still fails becomes an explicit uncertainty statement, never an unsupported claim.
+
+### 10. Streaming Generation
+`app/generation/streaming_generator.py` streams tokens from the configured LLM, buffers to sentence boundaries, validates and (if needed) regenerates each sentence as it completes, and emits `ANSWER_DELTA` per sentence and `ANSWER_VERSION_CREATED` once the full answer is assembled.
+
+### 11. Telemetry
+Every stage above calls the same `EventSink` protocol. `app/telemetry/event_logger.py` enqueues each event on a non-blocking `asyncio.Queue` and batches writes to SQLite from a background task, so telemetry never sits on the request/streaming path.
+
+## Handling Incremental / Late Information
+
+```text
+User:  "Tell me about the cancellation policy for Orion Hall"
+        → Controller: stable + actionable entity → RETRIEVE (trigger=provisional)
+        → answer generated and streamed, citing Orion Hall's cancellation section
+
+User:  "...and also the catering options"
+        → Session Refinement: same topic, new entity delta → classified "refinement"
+        → only "catering" is retrieved for (not the whole buffer again)
+        → answer refined with the new evidence, session state never cleared
+```
+
+This is `app/session/delta_engine.classify_segment` plus `retrieval_controller._refine`: once `session.has_retrieved_for_topic` is set, a later chunk's entity delta is classified before any retrieval happens, and a `refinement` classification builds its sub-query text from only the changed slots (`build_delta_query`), never the accumulated transcript buffer. This behavior is covered by `tests/unit/test_retrieval_controller.py`'s refinement suite and `tests/unit/test_delta_engine.py`, and was also exercised in the real, non-fake end-to-end validation described in [Evaluation](#evaluation).
+
+## Multi-Intent Example
+
+```text
+Utterance:  "I have a question about student policies — specifically the library fine
+             policy and the hostel visitor registration procedure."
+
+  compound signal detected (spaCy: "and" joining two slot-bound noun phrases)
+        → decomposition call → 2 sub-queries:
+             1. "What is the library fine policy?"        (intent_label: library fine)
+             2. "What is the hostel visitor registration procedure?"  (intent_label: hostel registration)
+        → both retrieved concurrently (dense + sparse), scoped to the same corpus_id
+        → fused, reranked, capped into one evidence set
+        → answer synthesized citing both sub-intents' evidence independently,
+          or an explicit uncertainty note for whichever sub-intent lacked support
+```
+
+This exact utterance was run end-to-end against the real (non-fixture) `northstar_demo_extended` demo corpus with the Groq provider: both sub-queries were correctly decomposed, retrieved, and reranked, and the hostel visitor sub-question produced a grounded, cited answer while the library-fine sub-question — for which the retrieved evidence did not support a citable claim — correctly produced an explicit uncertainty statement instead of a guess.
+
+## Grounding and Citation Safety
+
+- **Corpus-only evidence.** The generation prompt is built exclusively from that turn's retrieved-and-reranked evidence (`app/generation/prompt_builder.py`); nothing outside the supplied corpus is ever injected.
+- **Citation validation by construction.** `validate_sentence` looks up every cited `[doc_id section]` tag against a dict built only from that turn's real evidence — an unresolvable tag is a dictionary miss, not a judgment call, so fabrication is structurally excluded rather than filtered after the fact.
+- **Fabricated citation protection.** A fabricated tag triggers exactly one regeneration attempt with the real available tags listed explicitly; if it still fails, the sentence becomes an uncertainty statement — no output ever ships a citation that wasn't checked.
+- **Insufficient evidence.** If the turn's top rerank score never clears `MIN_RELEVANCE`, no generation call is made at all — an explicit uncertainty event is emitted per unresolved sub-query instead.
+- **Contradiction handling.** Evidence rows sharing an entity/attribute with materially different values are flagged as a contradiction pair and both retained through truncation; the prompt instructs the model to state both values explicitly rather than silently pick one.
+
+## Corpus Isolation
+
+`corpus_id` is fixed at session creation (`POST /session`) and immutable for that session's lifetime (`app/session/session_store.py`). Every retrieval call — dense (a Qdrant payload filter) and sparse (a separate BM25 pickle per `corpus_id`) — scopes exclusively to it; no query path can return another corpus's chunks. This is exercised directly by `tests/integration/test_corpus_isolation.py`.
+
+Corpora live under `data/corpus/<corpus_id>/` (layout: [`data/corpus/README.md`](data/corpus/README.md)) and are ingested by `scripts/ingest_corpus.py` into a Qdrant collection plus a per-corpus BM25 pickle. Three distinct corpus sources exist in this repository, and none should be confused with the others:
+
+| Location | What it is |
 |---|---|
-| 1 | Pydantic data models, `TelemetryEvent` envelope, centralized `Settings`, `/health` + `/ready`, CI/lint scaffold |
-| 2 | Per-corpus `slots.yaml` schema validation, deterministic chunking, bge-small embeddings, Qdrant dense index, per-corpus BM25 sparse index, `scripts/ingest_corpus.py` |
-| 3 | Streaming Retrieval Controller: chunk buffering with out-of-order reordering, embedding-stability + entity-delta WAIT/RETRIEVE/NO_RETRIEVAL decisions, presentation-only-query suppression |
-| 4 | Multi-Intent Decomposer: deterministic (spaCy dependency-parse) compound-signal detection gating a structured LLM call (Anthropic or Gemini), over-fragmentation merge, LLM-failure fallback |
-| 5 | Evidence Fusion (Reciprocal Rank Fusion + dedup + contradiction flagging) and Cross-Encoder Reranking with a global evidence cap |
-| 6 | Session Refinement: same-topic delta classification, delta-only sub-query retrieval, no full re-decomposition on a late-arriving constraint |
-| 7 | Grounding Validator + Streaming Generator: sentence-by-sentence generation, citation-tag validation against the real evidence set, one regeneration attempt, uncertainty fallback — structurally prevents fabricated citations |
-| 8 | Telemetry/Observability: async, non-blocking `EventLogger` (SQLite-backed), `GET /session/{id}/events` (SSE + JSON), `SESSION_RESYNC` on reconnect |
-| 9 | Evaluation/Benchmark harness: a 10-scenario held-out benchmark suite, the ten `TELEMETRY.md` metric formulas, `POST`/`GET /evaluate`, `scripts/run_benchmark.py` |
-| 10 | Docker/Deployment: real startup corpus ingestion (background task, gates `/ready`), persistent Qdrant + SQLite + BM25 storage via named volumes, `benchmarks/` shipped in the image, CI benchmark job |
+| `data/corpus/northstar_demo_extended/` | A bundled **demo** corpus — ten Markdown policy documents (library, hostel, fees, grievance, internships, laboratories, placements, scholarships, a student handbook) plus `slots.yaml` — used to validate ingestion, retrieval, and the frontend end-to-end. This is demonstration content authored for this project, **not** a real institution's production data. |
+| `tests/fixtures/corpora/` | Synthetic fixtures (`alpha`, `beta`) used only by unit/integration tests. |
+| `benchmarks/streaming_suite_v1/corpus/benchmark_v1/` | The held-out synthetic corpus used only by the evaluation harness — kept structurally separate from `data/corpus/` per REQ-EVAL-01 (no benchmark content may leak into application code or the served corpus). |
 
-## 4. Technology stack
+No externally-sourced, real-world "production" corpus (e.g. a live institution's actual policy database) is bundled in this repository.
 
-| Layer | Choice |
+## Observability
+
+Every pipeline stage emits `TelemetryEvent{event_id, session_id, timestamp, event_type, payload, trace_id}` through the same `EventSink` protocol. `trace_id` is generated once per pipeline turn and threaded through every event that turn produces, so `GET /session/{id}/events?trace_id=...` reconstructs one full turn end-to-end.
+
+Event types actually emitted (`app/core/events.py`, `docs/TELEMETRY.md` §2): `RETRIEVAL_DECISION`, `SUBQUERY_CREATED`, `RETRIEVAL_STARTED`, `RETRIEVAL_COMPLETED`, `RERANK_COMPLETED`, `CITATION_CREATED`, `ANSWER_DELTA`, `ANSWER_VERSION_CREATED`, `UNCERTAINTY`, `ERROR`, `SESSION_UPDATED`, `SESSION_RESYNC` (plus the inbound `TRANSCRIPT_CHUNK`).
+
+Events are written via `asyncio.Queue.put_nowait()` (never blocks the request/streaming path) and batched to SQLite by a background task every 100ms (`app/telemetry/event_logger.py`). `GET /session/{id}/events` reads from this persistent store — independent of any single live WebSocket connection — as SSE by default, or `?format=json` for the array the benchmark harness consumes.
+
+## Evaluation
+
+The benchmark suite (`benchmarks/streaming_suite_v1/`, driven by `scripts/run_benchmark.py` / `benchmarks/harness.py`) replays 10 structural scenarios (`BENCH-01`..`BENCH-10` — single/compound intent, early/late retrieval, session refinement, presentation-only suppression, insufficient/conflicting evidence, an injected citation-fabrication fault) chunk-by-chunk through the real WebSocket API and grades them from the resulting `TelemetryEvent` log. No benchmark prompt, sub-query, or answer text is embedded in `/app` (REQ-EVAL-01).
+
+**Verified from a persisted offline run** (`benchmarks/results/run_1790299972.json`, `python scripts/run_benchmark.py --use-fakes` — deterministic test doubles for the two LLM calls only; the controller, decomposition-gating, retrieval, fusion, contradiction-flagging, citation-validation, and telemetry logic are all real):
+
+- **10/10 benchmark scenarios passed**
+- **G2 (Early Retrieval Rate) = 1.0** (target ≥ 0.80)
+- **G3 (Multi-Intent Accuracy) = 1.0** (target ≥ 0.70)
+- **G4 fabrication rate = 0.0** (target = 0.0)
+- **G5 (Session Refinement Accuracy) = 1.0**
+- **G6 (Telemetry Coverage) = 1.0** (target = 1.0)
+
+These are offline/deterministic-provider results, not real-LLM benchmark-suite results — they measure the pipeline logic, not real decomposition/generation quality at that request volume.
+
+**Real-provider attempts:** a full benchmark-suite run against the real, non-faked Gemini provider hit Gemini's free-tier rate limit (`429 RESOURCE_EXHAUSTED`) within the first scenario — an account/quota limitation, not a code defect; the built-in LLM-failure fallback degraded gracefully rather than crashing. Separately, single real end-to-end runs — one containerized (Gemini) and one through the frontend against the real Groq provider (`openai/gpt-oss-120b`) — each produced a genuine, correctly-grounded, cited answer via the real WebSocket API (retrieval, reranking, generation, citation, `ANSWER_VERSION_CREATED`, and telemetry all confirmed against the live provider). Neither is a substitute for a full real-provider benchmark-suite run.
+
+**Test suite:** `pytest -q` currently reports **409 passed, 5 skipped** (skips are opt-in integration tests that need a running Qdrant server or `RUN_MODEL_TESTS=1` real-model downloads).
+
+## Ablation Studies
+
+`docs/EVALUATION.md` §5 specifies two required ablations as reporting deliverables (not automated CI gates):
+
+1. **Hybrid vs. dense-only retrieval** — run the suite with BM25 disabled and compare retrieval precision/recall and citation grounding against the full hybrid configuration.
+2. **Rule-based vs. model-based controller** — compare the deterministic stability+entity controller against an LLM-only retrieval-timing decision on Early Retrieval Rate and false-trigger rate.
+
+**Status: infrastructure and requirement documented, experiments not yet executed.** No ablation results exist anywhere in this repository; none are reported here, and none should be inferred from the G2–G6 numbers above, which reflect the full configuration only.
+
+## Performance / Metrics
+
+`app/telemetry/metrics.py` implements all ten `docs/TELEMETRY.md` §5 formulas as pure functions over the `TelemetryEvent` log: `early_retrieval_rate`, `multi_intent_accuracy`, `citation_grounding_rate`, `fabricated_citation_rate`, `retrieval_precision`, `retrieval_recall`, `time_to_first_token`, `end_to_end_latency`, `token_cost`, `session_refinement_accuracy`.
+
+**Actually measured** (from the persisted offline benchmark run, [Evaluation](#evaluation)):
+
+| Metric | Value |
 |---|---|
-| Backend framework | FastAPI (REST + WebSocket), Pydantic v2 |
-| Language / runtime | Python 3.11+ |
-| LLM (decomposition + generation) | Anthropic Claude or Google Gemini, selected by `LLM_PROVIDER` |
-| Embedding model | `BAAI/bge-small-en-v1.5` (sentence-transformers, local CPU) |
-| NLP (entity/compound-signal extraction) | spaCy (`en_core_web_sm`) — deterministic `PhraseMatcher` + dependency parse, no opaque NER |
-| Vector database | Qdrant |
-| Sparse retrieval | BM25 (`rank_bm25`), one persisted index per `corpus_id` |
-| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
-| Telemetry store | SQLite, written via an async queue + batching background task |
-| Logging | `structlog` (JSON) |
-| Lint/format | `ruff` |
-| Testing | `pytest` + `pytest-asyncio` |
-| Containerization | Docker + `docker compose` (`app`, `qdrant`) |
+| Early Retrieval Rate | 1.0 |
+| Multi-Intent Accuracy | 1.0 |
+| Fabricated Citation Rate | 0.0 |
+| Session Refinement Accuracy | 1.0 |
+| Telemetry Coverage | 1.0 |
+| Retrieval Precision / Recall | reported per-scenario in the run JSON (e.g. BENCH-01: precision 0.11, recall 1.0) |
 
-## 5. Repository structure
+**Not currently measured or reported anywhere in this repository:** Time-to-First-Token, End-to-End Latency, and Token Cost — their formulas exist in `app/telemetry/metrics.py`, but the benchmark harness's current report does not yet call them, and `PRD_TRD.md` §5.3's latency numbers (e.g. "TTFT <1200ms p50") are **targets**, not measured results. No latency, cost, or throughput number is invented here.
+
+## Tech Stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| Backend framework | FastAPI, Pydantic v2 | REST + WebSocket API, request/response validation |
+| Language / runtime | Python 3.11+ | Application runtime |
+| LLM (decomposition + generation) | Anthropic Claude, Google Gemini, or Groq (`LLM_PROVIDER`) | Structured multi-intent decomposition and streaming answer generation |
+| Embedding model | `BAAI/bge-small-en-v1.5` (sentence-transformers, local CPU) | Chunk/query embeddings, no external call on the timing-critical path |
+| NLP | spaCy `en_core_web_sm` | Deterministic entity extraction + compound-signal detection (dependency parse) |
+| Vector database | Qdrant | Dense retrieval, `corpus_id`-filtered payload |
+| Sparse retrieval | BM25 (`rank_bm25`) | One persisted index per `corpus_id` |
+| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder relevance scoring |
+| Telemetry store | SQLite | Async-queue-batched event log |
+| Logging | `structlog` (JSON) | Structured process logs |
+| Frontend | React 18, TypeScript, Vite, CSS Modules | Judge-facing live view of the pipeline (transcript, controller state, multi-intent, evidence, citations, telemetry) |
+| Containerization | Docker, Docker Compose | `app`, `qdrant`, `frontend` services |
+| Lint/format | ruff | Lint + format, single tool |
+| Testing | pytest, pytest-asyncio | Unit + integration suites |
+| CI | GitHub Actions | lint → test → offline benchmark, on every push/PR to `main` |
+
+## Repository Structure
 
 ```text
 app/
-  api/            session.py (POST/GET /session), stream.py (WS /session/{id}/stream),
-                  events.py (GET /session/{id}/events), evaluate.py (POST/GET /evaluate), deps.py (auth)
-  core/           config.py (Settings), events.py (TelemetryEvent envelope), embeddings.py, slots.py
+  api/            session.py, stream.py, events.py, evaluate.py, deps.py — REST/WS endpoints + auth
+  core/           config.py (Settings), events.py (TelemetryEvent), embeddings.py, slots.py
   controller/     retrieval_controller.py, entity_extraction.py, suppression.py
-  decomposition/  multi_intent.py (compound-signal detection + Anthropic/Gemini decomposer)
-  retrieval/      dense.py (Qdrant), sparse_bm25.py, hybrid.py, fusion.py
+  decomposition/  multi_intent.py — compound-signal detection + Anthropic/Gemini/Groq decomposer
+  retrieval/      dense.py, sparse_bm25.py, hybrid.py, fusion.py
   reranking/      cross_encoder.py
-  session/        session_store.py, delta_engine.py (refinement classification)
+  session/        session_store.py, delta_engine.py
   generation/     streaming_generator.py, prompt_builder.py
   grounding/      citation_validator.py
-  telemetry/      event_logger.py (async SQLite writer), metrics.py (benchmark formulas)
+  telemetry/      event_logger.py, metrics.py
   models/         Pydantic models for every entity in PRD_TRD.md §7
   main.py         app factory, composition root, /health, /ready
 
-scripts/
-  ingest_corpus.py    corpus ingestion CLI
-  run_benchmark.py    Phase 9 benchmark CLI
-
-benchmarks/
-  harness.py                    replay + grading engine (never imported by /app at module scope)
-  streaming_suite_v1/           held-out synthetic corpus + 10 gold-labeled BENCH scenarios
-  results/                      benchmark run output (gitignored)
-
-data/
-  corpus/         production corpora, one directory per corpus_id (empty until you add one)
-  processed/      generated BM25 indexes + manifests (gitignored)
-
+frontend/         React + TypeScript + Vite judge-facing UI (own Dockerfile + nginx config)
+benchmarks/       harness.py (replay + grading), streaming_suite_v1/ (held-out corpus + scenarios), results/
+data/             corpus/ (ingestable corpora incl. the bundled demo corpus), processed/ (generated, gitignored)
 docs/             ARCHITECTURE.md, API.md, TELEMETRY.md, EVALUATION.md — canonical specs
-docker/           Dockerfile, docker-compose.yml
-tests/            unit/ + integration/, mirroring the app/ layout
+docker/           Dockerfile, docker-compose.yml (app + qdrant + frontend)
+scripts/          ingest_corpus.py, run_benchmark.py
+tests/            unit/ (24 files) + integration/ (7 files)
 ```
 
-## 6. Local setup and installation
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11+
+- Docker + Docker Compose (for the one-command path)
+- Node.js (only if running the frontend outside Docker)
+- An API key for at least one of: Anthropic, Google Gemini, or Groq
+
+### 1. Clone
+
+```bash
+git clone https://github.com/Prabh-84/streaming-rag.git
+cd streaming-rag
+```
+
+### 2. Environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and fill in:
+
+| Purpose | Variable |
+|---|---|
+| LLM provider selection | `LLM_PROVIDER` (`anthropic` \| `gemini` \| `groq`) |
+| Anthropic key (if `LLM_PROVIDER=anthropic`) | `ANTHROPIC_API_KEY` |
+| Gemini key (if `LLM_PROVIDER=gemini`) | `GEMINI_API_KEY` |
+| Groq key (if `LLM_PROVIDER=groq`) | `GROQ_API_KEY` |
+| This application's own bearer token | `API_KEY` |
+| Extra header required by `/evaluate` | `EVAL_KEY` |
+
+**Never commit `.env`** — it is already gitignored; `.env.example` ships with empty/placeholder values only. Only the LLM call needs a real key; embedding, entity extraction, retrieval, and reranking all run on local models.
+
+### 3. Start with Docker
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+```
+
+This builds and starts three services: `app` (FastAPI, `:8000`), `qdrant` (`:6333`), and `frontend` (nginx-served static build, `:5173`).
+
+### 4. Check Health / Readiness
+
+```bash
+curl http://localhost:8000/health   # {"status":"ok"} — liveness
+curl http://localhost:8000/ready    # {"status":"ready","qdrant":true,"ingestion":true,"embedder":true,"nlp":true} once warm
+```
+
+### 5. Ingest a Corpus
+
+A demo corpus (`northstar_demo_extended`) is already bundled and ingested automatically at container startup. To add your own, place it at `data/corpus/<corpus_id>/` (layout: [`data/corpus/README.md`](data/corpus/README.md)) before building the image, or ingest into a running container:
+
+```bash
+docker compose -f docker/docker-compose.yml exec app python scripts/ingest_corpus.py --all
+```
+
+### 6. Run the Application
+
+Open `http://localhost:5173` for the frontend, enter the `API_KEY` you set in `.env`, select a corpus, and either click "Start Demo" or type a question. Or drive the API directly — see [API / WebSocket](#api--websocket).
+
+### 7. Run Tests
 
 ```bash
 python -m venv .venv
 ./.venv/Scripts/pip install -r requirements.lock
 ./.venv/Scripts/pip install "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
-cp .env.example .env
-./.venv/Scripts/python -m pytest
+./.venv/Scripts/python -m pytest -v
 ./.venv/Scripts/python -m ruff check .
 ```
 
-The spaCy model is installed as a direct pip wheel rather than via `python -m spacy download` — on some networks the `spacy download` CLI's redirect target resets the connection while the same wheel installs cleanly through plain pip. Use whichever succeeds in your environment.
-
-`.env.example`'s defaults (`QDRANT_URL=http://qdrant:6333`, `SQLITE_PATH=/data/app.db`) target the Docker Compose network. For local (non-Docker) runs, either start Qdrant separately and point `QDRANT_URL` at it (e.g. `http://localhost:6333`), or run `docker compose -f docker/docker-compose.yml up -d qdrant` and leave the rest local; also override `SQLITE_PATH` to a local path (e.g. `./data/app.db`) since `/data/app.db` is an absolute container path.
-
-## 7. Environment configuration
-
-All settings are centralized in `app/core/config.py` (`Settings`, loaded from `.env`); see `.env.example` for the full list with defaults. The ones most relevant to running the pipeline end to end:
-
-- **`LLM_PROVIDER`** — `anthropic` or `gemini`. Selects which client `app/decomposition/multi_intent.py` and `app/generation/streaming_generator.py` construct for multi-intent decomposition and grounded answer generation.
-- **`ANTHROPIC_API_KEY`** — required when `LLM_PROVIDER=anthropic`.
-- **`GEMINI_API_KEY`** — required when `LLM_PROVIDER=gemini`.
-- **`GEMINI_MODEL`** / **`LLM_MODEL`** — model names for the Gemini and Anthropic paths respectively.
-- **`API_KEY`** — bearer token required on every REST/WS endpoint.
-- **`EVAL_KEY`** — additional header (`X-Eval-Key`) required by `POST`/`GET /evaluate`, on top of `API_KEY`.
-
-**Real API keys belong only in your local, untracked `.env` file and must never be committed.** `.env` is already gitignored; `.env.example` intentionally ships with empty/placeholder values. Only the LLM call itself needs a real key — every other pipeline stage (embedding, entity extraction, retrieval, reranking) runs on local, non-API models.
-
-## 8. Corpus ingestion and corpus isolation
-
-Put a corpus at `data/corpus/<corpus_id>/` (layout and `slots.yaml` schema: [`data/corpus/README.md`](data/corpus/README.md)) **before building the image** — `docker/Dockerfile` bakes `data/corpus` in at build time, and `app/main.py`'s startup lifespan then discovers and ingests every corpus directory under `CORPUS_ROOT` automatically, as a background task that never blocks the port bind. `/ready`'s `ingestion` field only turns `true` once that has genuinely completed for every discovered corpus; if none is mounted at all, it stays `false` forever (deliberately — see §9) rather than the container silently serving an empty index.
-
-To (re-)ingest without rebuilding the image (e.g. after editing a corpus in a running container), or for local (non-Docker) development:
+### 8. Run Benchmarks
 
 ```bash
-python scripts/ingest_corpus.py --corpus-id <corpus_id>   # or --all; --force to rebuild
-# inside Docker:
-docker compose -f docker/docker-compose.yml exec app python scripts/ingest_corpus.py --all
+./.venv/Scripts/python scripts/run_benchmark.py --use-fakes   # deterministic, offline
+./.venv/Scripts/python scripts/run_benchmark.py               # real configured provider
 ```
 
-Outputs: Qdrant points in the `corpus_chunks` collection (payload carries `corpus_id`), plus `PROCESSED_DIR/bm25__<corpus_id>.pkl`, `chunks__<corpus_id>.jsonl`, and `manifest__<corpus_id>.json` (persisted at `/data/processed` in Docker, via the same `app_data` volume `SQLITE_PATH` uses — survives container recreation). An unchanged corpus re-ingests as a no-op. Malformed input (missing/invalid `slots.yaml`, non-UTF-8 documents, no supported documents) fails that corpus's ingestion and is logged; it does not crash the process.
+## API / WebSocket
 
-**Corpus isolation:** `corpus_id` is fixed at session creation (`POST /session`) and is immutable for that session's lifetime. Every retrieval call — dense (Qdrant payload filter) and sparse (a separate BM25 pickle per `corpus_id`) — scopes exclusively to the session's own `corpus_id`; no query path can return another corpus's chunks. This is exercised directly by `tests/integration/test_corpus_isolation.py` and `tests/unit/test_session_store.py`.
+Full contract: [`docs/API.md`](docs/API.md). Every REST endpoint and the WS handshake require `API_KEY`.
 
-The synthetic fixtures under `tests/fixtures/corpora/` and the held-out benchmark corpus under `benchmarks/streaming_suite_v1/corpus/` are separate, self-contained test/evaluation corpora — never copy them into `data/corpus/`.
-
-## 9. Running the application
-
-**Local:**
-```bash
-./.venv/Scripts/uvicorn app.main:app --reload
-```
-
-**Docker** (`docker-compose.yml` lives under `docker/`, so reference it explicitly):
-```bash
-cp .env.example .env
-docker compose -f docker/docker-compose.yml up --build
-```
-
-This starts two services: `app` (FastAPI on `:8000`) and `qdrant` (`:6333`). Verify:
-
-```bash
-curl http://localhost:8000/health   # {"status":"ok"} — liveness, no dependency checks
-curl http://localhost:8000/ready    # {"status":"ready","qdrant":true,"ingestion":true,"embedder":true,"nlp":true} once warm
-```
-
-`/ready` gates on live Qdrant connectivity, ingestion having genuinely completed for every discovered corpus, and both the embedding model and the spaCy model having finished warming up. If `data/corpus/` has no corpus directories at all, `ingestion` stays `false` forever — a deliberate design choice (PRD_TRD.md §11 risk register) so a "forgot to mount a corpus" deployment mistake surfaces as `/ready` never turning healthy, not as a container that starts fine and silently serves an empty index. In local testing, a fresh deployment (real model downloads, one small corpus) reached `ready` in about 40 seconds.
-
-## 10. Main REST/WebSocket usage
-
-Full contract: [`docs/API.md`](docs/API.md). All REST endpoints and the WS handshake require `API_KEY`.
-
-**Create a session:**
+**`POST /session`** — create a session:
 ```bash
 curl -X POST http://localhost:8000/session \
   -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"corpus_id": "default"}'
-# {"session_id": "...", "created_at": "...", "ws_url": "/session/.../stream?token=..."}
+  -d '{"corpus_id": "northstar_demo_extended"}'
+# → {"session_id": "...", "created_at": "...", "ws_url": "/session/.../stream?token=..."}
 ```
 
-**Stream a transcript** — connect to `ws://localhost:8000/session/{id}/stream?token=$API_KEY` and send `TRANSCRIPT_CHUNK` frames as the user speaks:
+**`WS /session/{id}/stream`** — connect to `ws://localhost:8000/session/{id}/stream?token=$API_KEY`, send `TRANSCRIPT_CHUNK` frames:
 ```json
 {"event_type": "TRANSCRIPT_CHUNK", "payload": {"seq": 0, "text_delta": "I need the cancellation policy", "t_offset_ms": 0, "is_final": false}}
 ```
-The server streams back every `TelemetryEvent` the turn produces on the same socket (`RETRIEVAL_DECISION`, `SUBQUERY_CREATED`, `RETRIEVAL_STARTED/COMPLETED`, `RERANK_COMPLETED`, `CITATION_CREATED`, `ANSWER_DELTA`, `ANSWER_VERSION_CREATED`, `UNCERTAINTY`, `ERROR`, ...). Reconnecting to the same `session_id` emits a `SESSION_RESYNC` frame first, then resumes.
+The server streams back every `TelemetryEvent` the turn produces on the same socket. Reconnecting to the same `session_id` emits `SESSION_RESYNC` first, then resumes — no chunk replay. Auth failure closes with code `4401`; unknown/expired session closes with `4404`.
 
-**Read session state:** `GET /session/{id}` returns the current snapshot (`corpus_id`, `status`, `entities`, `latest_answer_version`).
+**`GET /session/{id}`** — current snapshot (`corpus_id`, `status`, `entities`, `latest_answer_version`).
 
-## 11. Telemetry / events API
+**`GET /session/{id}/events`** — full ordered event log; `?trace_id=`, `?event_type=`, `?since=` filters; SSE by default, `?format=json` for a single array.
 
-`GET /session/{id}/events` (REQ-OBS-03) returns the full, ordered `TelemetryEvent` log for a session, persisted independently of any live WebSocket connection (via the async `EventLogger`, `app/telemetry/event_logger.py`). Query params: `trace_id` (one pipeline turn), `event_type`, `since`. Transport: Server-Sent Events by default, or `?format=json` for a single JSON array (what the benchmark harness uses).
+**`POST /evaluate`** / **`GET /evaluate/{run_id}`** — queue and poll a benchmark run; requires `API_KEY` **and** `X-Eval-Key: $EVAL_KEY`.
 
-```bash
-curl "http://localhost:8000/session/{id}/events?format=json" -H "Authorization: Bearer $API_KEY"
-```
+**`GET /health`** / **`GET /ready`** — liveness / readiness, unauthenticated.
 
-Full event-type catalog, payload fields, and the ten benchmark metric formulas: [`docs/TELEMETRY.md`](docs/TELEMETRY.md).
+## Configuration
 
-## 12. Evaluation / benchmark usage
+All settings are centralized in `app/core/config.py` (`Settings`); full list with defaults: `.env.example`.
 
-Run the held-out benchmark suite (`benchmarks/streaming_suite_v1/`, 10 gold-labeled `BENCH-01`..`BENCH-10` scenarios covering single/compound intent, early/late retrieval, session refinement, presentation-only suppression, insufficient/conflicting evidence, and an injected citation-fabrication fault) directly:
+| Variable | Required | Purpose | Default |
+|---|---|---|---|
+| `LLM_PROVIDER` | Yes | Selects the decomposition/generation client | `anthropic` |
+| `ANTHROPIC_API_KEY` | If `LLM_PROVIDER=anthropic` | Anthropic auth | `""` |
+| `GEMINI_API_KEY` | If `LLM_PROVIDER=gemini` | Gemini auth | `""` |
+| `GEMINI_MODEL` | No | Gemini model name | `gemini-3.6-flash` |
+| `GROQ_API_KEY` | If `LLM_PROVIDER=groq` | Groq auth | `""` |
+| `GROQ_MODEL` | No | Groq model name (structured-output capable) | `openai/gpt-oss-120b` |
+| `LLM_MODEL` | No | Anthropic model name | `claude-sonnet-5` |
+| `API_KEY` | Yes | Bearer token for every REST/WS call | `change_me_local_dev` |
+| `EVAL_KEY` | For `/evaluate` | Extra header required on `/evaluate` | `change_me_eval` |
+| `QDRANT_URL` | Yes | Qdrant connection | `http://qdrant:6333` |
+| `SQLITE_PATH` | Yes | Telemetry DB path | `/data/app.db` |
+| `EMBEDDING_MODEL` | No | Dense embedding model | `BAAI/bge-small-en-v1.5` |
+| `RERANKER_MODEL` | No | Cross-encoder model | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| `CORPUS_ROOT` | No | Corpus directory | `data/corpus` |
+| `STABILITY_THRESHOLD` | No | Min. inter-chunk cosine similarity to retrieve | `0.90` |
+| `MAX_WAIT_CHUNKS` | No | Chunks before a forced decision | `6` |
+| `MERGE_THRESHOLD` | No | Sub-query merge cosine threshold | `0.85` |
+| `MIN_RELEVANCE` | No | Min. rerank score to keep a chunk | `0.35` |
+| `MAX_TOTAL_EVIDENCE` | No | Global evidence cap per turn | `15` |
+| `SESSION_TTL_SECONDS` | No | Idle session expiry | `1800` |
 
-```bash
-./.venv/Scripts/python scripts/run_benchmark.py               # real configured providers (LLM_PROVIDER, embedder, reranker)
-./.venv/Scripts/python scripts/run_benchmark.py --use-fakes   # deterministic, offline (no network, no API key needed)
-```
+(Full list — chunking, timeouts, k-values, token budgets — in `.env.example`; every key there corresponds 1:1 to a `Settings` field, enforced by `tests/unit/test_config_loads.py::test_env_example_keys_match_settings_fields`.)
 
-Each run prints a per-scenario pass/fail, the G2–G6 gate results, and the computed metrics, and writes the full report to `benchmarks/results/<run_id>.json` (gitignored — run output, not suite data).
-
-The same suite can also be triggered over HTTP: `POST /evaluate` (requires `API_KEY` **and** `X-Eval-Key: $EVAL_KEY`) queues a run and returns `{"run_id", "status": "queued"}` (`202`); poll `GET /evaluate/{run_id}` for `gates`/`metrics` once `status` is `complete`. Full contract: [`docs/API.md`](docs/API.md) §7–8.
-
-`docker/Dockerfile` copies `app/`, `scripts/`, and `benchmarks/` into the image, so both `POST /evaluate` and `scripts/run_benchmark.py` (via `docker compose exec app`) work inside the built container, not just from a local checkout.
-
-## 13. Phase 9 measured results
-
-The results below are from the offline, deterministic run (`scripts/run_benchmark.py --use-fakes`), which exercises the real controller, decomposition-gating, retrieval, fusion, contradiction-flagging, citation-validation, and telemetry logic end to end through the actual WebSocket/HTTP API — the only faked components are the two external LLM calls (multi-intent decomposition wording and answer generation wording), which is what makes the run deterministic and reproducible without network access.
-
-- **10/10 benchmark scenarios passed** (`BENCH-01` through `BENCH-10`)
-- **G2 (Early Retrieval Rate) = 1.0** (target ≥ 0.80) — pass
-- **G3 (Multi-Intent Accuracy) = 1.0** (target ≥ 0.70) — pass
-- **G4 fabrication rate = 0.0** (target = 0.0) — pass
-- **G5 (Session Refinement Accuracy) = 1.0** — pass
-- **G6 (Telemetry Coverage) = 1.0** (target = 1.0) — pass
-- **393 tests passed, 3 skipped** (full `pytest` suite, unit + integration)
-
-## 14. Real-provider (Gemini) benchmark attempt
-
-A genuine end-to-end **benchmark suite** run was also attempted against the real configured Gemini provider (no `--use-fakes`) — ~10 scenarios' worth of decomposition/generation calls in quick succession. It hit the Gemini API's **free-tier rate limit (HTTP 429 `RESOURCE_EXHAUSTED`, 5 requests/minute)** within the first scenario. This is an external account/quota limitation, not a defect in this codebase — the deterministic fallback-on-LLM-failure path (built in Phase 4) degraded gracefully exactly as designed rather than crashing. **The fake-provider results in §13 are not a substitute for a full real-Gemini *benchmark suite* run**; they measure the deterministic pipeline logic, not real LLM-driven decomposition/generation quality at that request volume.
-
-A **single real request** is a different story: a Phase 10 containerized verification (fresh `docker compose up --build`, real Qdrant, real embedder/reranker, real `GEMINI_API_KEY`) sent one transcript through the live WebSocket API and got a genuine, correctly-grounded Gemini-generated answer with a valid citation back, end to end — retrieval, reranking, generation, citation, telemetry, and session resync all confirmed working against the real provider. The free-tier limit is specifically a *request-rate* ceiling (5/minute), not a "Gemini integration doesn't work" finding. A sustained real-Gemini benchmark *suite* run, or any production traffic beyond a handful of requests per minute, needs a Gemini key with sufficient quota (or `LLM_PROVIDER=anthropic` with a funded Anthropic key).
-
-## 15. Tests and lint
+## Testing
 
 ```bash
 ./.venv/Scripts/python -m pytest -v
@@ -269,9 +435,88 @@ A **single real request** is a different story: a Phase 10 containerized verific
 ./.venv/Scripts/python -m ruff format --check .
 ```
 
-Most tests use a deterministic fake embedder and Qdrant's in-memory mode — no model download, no server. A few opt-in integration suites exercise the real pieces:
+- **Unit tests** (`tests/unit/`, 24 files) — one file per module, deterministic fake embedder/decomposer/generator/reranker, no network, no model download.
+- **Integration tests** (`tests/integration/`, 7 files) — real Qdrant in-memory mode by default; a few opt-in suites need a running Qdrant server or `RUN_MODEL_TESTS=1` (downloads `bge-small` / the cross-encoder).
+- **Fake-provider testing** — every LLM-dependent test (`FakeDecomposer`, `FakeGenerationLLM`) and the offline benchmark run (`--use-fakes`) never make a real network call.
+- **Real-provider verification** — done manually against a live Docker deployment for Gemini and Groq (see [Evaluation](#evaluation)); not part of the automated test suite, since it requires a funded API key.
 
-```bash
-docker compose -f docker/docker-compose.yml up -d qdrant   # tests/integration/test_qdrant_server.py runs when this is up
-RUN_MODEL_TESTS=1 ./.venv/Scripts/python -m pytest tests/integration/test_embedding_model.py tests/integration/test_reranking_real_model.py   # downloads bge-small / the cross-encoder
-```
+Current verified result: **409 passed, 5 skipped**.
+
+## Reproducibility
+
+- **Pinned dependencies** — `requirements.lock` pins exact versions for every runtime and dev dependency.
+- **Docker** — `docker compose -f docker/docker-compose.yml up --build` is the one-command path; the image bakes in the current codebase and bundled corpus.
+- **Deterministic IDs** — `doc_id` is path-derived, `chunk_id` is a UUIDv5 over `(corpus_id, doc_id, section, chunk_index, sha256(text))`; an unchanged corpus re-ingests to an identical chunk set.
+- **Corpus isolation** — every retrieval read is scoped by `corpus_id`, verified by `tests/integration/test_corpus_isolation.py`.
+- **Benchmark replay** — `scripts/run_benchmark.py --use-fakes` is fully offline and deterministic, and is what CI runs.
+- **CI** — `.github/workflows/ci.yml` runs `ruff check .` → `pytest` → the offline benchmark suite on every push/PR to `main`.
+
+## Design Decisions
+
+| Decision | Why |
+|---|---|
+| Five deterministic pipeline stages, no agent orchestration | Hard Constraint HC-5 (Architectural Parsimony) — each stage is independently testable and auditable; no component's behavior depends on an LLM's freeform judgment about *whether* to run |
+| Controller gates retrieval on stability **and** entity, never either alone | Prevents both eager retrieval on noisy partial chunks and permanent WAIT on a stable-but-empty clause |
+| Hybrid (dense + sparse) retrieval | Dense and BM25 fail on different query shapes; RRF fusion combines them without an LLM call |
+| Reranking only after fusion, never before | The cross-encoder only ever scores an already-deduplicated candidate pool, keeping its cost bounded |
+| Delta-only retrieval for refinements | A late constraint should not force re-decomposing and re-searching the entire accumulated transcript |
+| Session-only state, no cross-session storage | Hard Constraint HC-4 — session memory is ephemeral and scoped to the active session |
+| Async telemetry queue | Observability must never add request-path latency; the queue write is the only thing on the hot path |
+| spaCy for entity/compound-signal extraction, not an LLM | Deterministic, local, auditable, zero external call on the timing-critical decision |
+| `ruff` for lint + format | One tool instead of three, satisfies the Definition of Done's CI-lint requirement |
+
+## Limitations
+
+- **No production corpus bundled.** `data/corpus/northstar_demo_extended/` is a demo corpus authored for this project, not a real institution's live data.
+- **Real-provider benchmark-suite runs are rate-limit constrained.** A full suite run against Gemini's free tier hits `429` within the first scenario; single real requests against Gemini and Groq succeed, but a sustained real-LLM benchmark run needs a funded key.
+- **Simulated transcript streaming.** Input is `TRANSCRIPT_CHUNK` frames (real or replayed at recorded timestamps) — this is not wired to a live microphone/ASR system.
+- **CPU-only embedding/reranking.** `bge-small` and the cross-encoder run on CPU by default; no GPU acceleration is configured.
+- **Ablation studies not yet executed** ([Ablation Studies](#ablation-studies)) — the comparisons are specified, not run.
+- **Latency/cost metrics not yet surfaced.** `time_to_first_token`, `end_to_end_latency`, and `token_cost` are implemented functions, not yet wired into the benchmark harness's report.
+- **No `/metrics` endpoint.** `prometheus-client` is a pinned dependency, but no Prometheus scrape endpoint is currently implemented; observability is via the `TelemetryEvent`/SQLite/`GET /session/{id}/events` path only.
+- **Frontend has no CI coverage.** `.github/workflows/ci.yml` lints/tests/benchmarks the Python backend only; the frontend build is not part of the automated pipeline.
+- **In-memory session state.** Session records live in a process dict, not a durable store — a process restart loses active sessions (their telemetry history in SQLite survives; the live session objects do not).
+
+## Security / Privacy
+
+- Secrets are read from environment variables only (`app/core/config.py`); `.env` is gitignored and no key is committed anywhere in this repository.
+- REST endpoints require `Authorization: Bearer <API_KEY>`; the WebSocket handshake authenticates via a query-string token for the same reason browsers can't set custom headers on a WS upgrade; `/evaluate` additionally requires `X-Eval-Key`.
+- Session state is held in an in-memory `SessionStore`, keyed exclusively by `session_id`, purged on explicit close or TTL expiry (`SESSION_TTL_SECONDS`) — no field is written to durable cross-session storage.
+- No cross-session profiling: each session's entities, embeddings, and answer history are scoped to that session's own record; there is no query path that returns another session's or another corpus's data.
+- Corpus isolation is enforced at the retrieval layer (Qdrant payload filter + per-corpus BM25 file), not just at the API boundary.
+- This project makes no legal or compliance guarantees beyond what the code above actually does.
+
+## Hackathon Alignment
+
+| Theme 4 Requirement | Implementation |
+|---|---|
+| Early retrieval | Retrieval Controller (stability + entity conjunction) over streaming chunks |
+| Multi-intent decomposition | `app/decomposition/multi_intent.py` |
+| Hybrid retrieval + fusion | Dense (Qdrant) + BM25, RRF fusion + dedup (`app/retrieval/`) |
+| Reranking | Cross-encoder + global evidence cap (`app/reranking/cross_encoder.py`) |
+| Late-arriving constraints / refinement | Session Refinement + delta-only retrieval (`app/session/delta_engine.py`) |
+| Presentation-only suppression | `app/controller/suppression.py`, first-turn guard |
+| Session-scoped state | `app/session/session_store.py`, `SESSION_TTL_SECONDS` |
+| Grounding in corpus evidence | `app/grounding/citation_validator.py` |
+| Citations / traceability | `[doc_id section]` tags, `trace_id`-threaded telemetry |
+| Uncertainty on insufficient evidence | Explicit uncertainty events, never a guess |
+| Observability / telemetry | Structured `TelemetryEvent` log, async SQLite writer, `GET /session/{id}/events` |
+| Deterministic, lightweight architecture | Five pipeline stages, no agent orchestration (HC-5) |
+
+## Submission Checklist
+
+- [x] README documenting local run, corpus ingestion, benchmark run, and Docker deployment (this file)
+- [x] `docker compose up --build` one-command deployment (`app` + `qdrant` + `frontend`)
+- [x] Reproducible setup (pinned `requirements.lock`, `.env.example`, deterministic ingestion)
+- [x] System Architecture Brief (`docs/ARCHITECTURE.md`)
+- [x] Telemetry & Observability Schema (`docs/TELEMETRY.md`)
+- [x] Offline/deterministic benchmark run with G1–G6 results (`benchmarks/results/`)
+- [ ] Full real-provider benchmark-suite run (blocked by Gemini free-tier rate limits; single real requests verified against Gemini and Groq)
+- [ ] Ablation studies (specified in `docs/EVALUATION.md` §5, not yet executed)
+- [ ] ≥3 analyzed edge-case failures write-up (not yet produced as a standalone document)
+- [ ] System Demonstration Video, ≤5 minutes
+- [ ] Release/tag for the submitted commit
+
+## License
+
+No `LICENSE` file is currently present in this repository. All rights reserved by default under standard copyright until one is added.
