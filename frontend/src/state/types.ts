@@ -92,6 +92,7 @@ export interface AppSessionState {
   subqueries: SubqueryState[];
   evidence: EvidenceItem[];
   answer: AnswerState;
+  answerHistory: AnswerState[];
   activity: ActivityItem[];
   transcript: TranscriptChunkState[];
   entities: Record<string, string>;
@@ -118,6 +119,7 @@ export function createInitialSessionState(): AppSessionState {
     subqueries: [],
     evidence: [],
     answer: { versionNo: null, text: "", citationChunkIds: [], isStreaming: false, supersedes: null },
+    answerHistory: [],
     activity: [],
     transcript: [],
     entities: {},

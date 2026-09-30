@@ -6,6 +6,7 @@
 .versionBadge {
   font-family: var(--font-mono);
   color: var(--accent);
+  font-size: 12px;
 }
 
 .supersedes {
@@ -14,6 +15,9 @@
 
 .body {
   padding: 0 var(--space-5) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
 }
 
 .empty {
@@ -21,11 +25,37 @@
   font-size: 13px;
 }
 
+.card {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  padding: var(--space-3) var(--space-4);
+  animation: rise var(--duration-medium) var(--ease-standard);
+}
+
+.cardHeader {
+  display: flex;
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+
 .text {
   font-size: 16px;
   line-height: 1.75;
   color: var(--text-primary);
   letter-spacing: -0.001em;
+  margin: 0;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .citation {

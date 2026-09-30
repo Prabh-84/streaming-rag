@@ -39,6 +39,7 @@ export function useStreamingSession() {
       setLifecycleError(null);
       setPhase("creating_session");
       nextSeqRef.current = 0;
+      dispatch({ type: "NEW_SESSION" });
 
       let response;
       try {

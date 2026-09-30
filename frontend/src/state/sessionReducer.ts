@@ -20,7 +20,8 @@ export type SessionAction =
   | { type: "CHUNK_SENT"; chunk: TranscriptChunkState }
   | { type: "EVENT"; event: TelemetryEvent }
   | { type: "DISMISS_RESYNC_NOTICE" }
-  | { type: "DISMISS_ERROR" };
+  | { type: "DISMISS_ERROR" }
+  | { type: "NEW_SESSION" };
 
 function setStage(
   state: AppSessionState,
@@ -91,6 +92,13 @@ export function sessionReducer(state: AppSessionState, action: SessionAction): A
 
     case "DISMISS_ERROR":
       return { ...state, lastError: null };
+
+    case "NEW_SESSION":
+      return {
+        ...state,
+        answer: { versionNo: null, text: "", citationChunkIds: [], isStreaming: false, supersedes: null },
+        answerHistory: [],
+      };
 
     case "EVENT":
       return applyEvent(state, action.event);
@@ -233,7 +241,9 @@ function applyEvent(state: AppSessionState, event: TelemetryEvent): AppSessionSt
         isStreaming: false,
         supersedes: p.supersedes,
       };
-      next = { ...next, answer };
+      const alreadyRecorded = next.answerHistory.some((v) => v.versionNo === answer.versionNo);
+      const answerHistory = alreadyRecorded ? next.answerHistory : [...next.answerHistory, answer];
+      next = { ...next, answer, answerHistory };
       next = setStage(next, "GROUND", "completed");
       next = setStage(next, "ANSWER", "completed");
       return next;

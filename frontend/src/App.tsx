@@ -94,7 +94,7 @@ export default function App() {
                 </Banner>
               )}
               <PipelineView state={state} />
-              <AnswerPanel answer={state.answer} onCitationClick={handleCitationClick} />
+              <AnswerPanel answer={state.answer} answerHistory={state.answerHistory} onCitationClick={handleCitationClick} />
             </div>
           }
           right={
