@@ -14,9 +14,9 @@ Creates a new, empty session.
 
 **Request**
 ```json
-{"corpus_id": "default", "client_meta": {}}
+{"corpus_id": "northstar_demo_extended", "client_meta": {}}
 ```
-Both fields optional; `corpus_id` defaults to `"default"`.
+Both fields optional; `corpus_id` defaults to `"default"` (the `DEFAULT_CORPUS_ID` setting) if omitted — but no corpus named `"default"` ships in this repository, so a real request must name an actually-ingested `corpus_id` such as `northstar_demo_extended` (see [`data/corpus/README.md`](../data/corpus/README.md)).
 
 **Response `201`**
 ```json

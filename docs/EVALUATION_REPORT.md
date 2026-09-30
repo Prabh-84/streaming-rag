@@ -65,6 +65,20 @@ Source: `benchmarks/results/run_1790299972.json` (persisted offline run, `--use-
 G4_fabrication, G5, and G6 only — it does not compute or persist a G1 value in any result file
 inspected for this report. No G1 number is claimed.
 
+**On G4 specifically — three distinct claims, not one:** the full G4 gate (`docs/EVALUATION.md`
+§1) requires *both* ≥85% citation support *and* 0% fabrication.
+- **Measured, automated:** the fabrication half only — `fabricated_citation_rate = 0.0`, computed
+  from real `CITATION_CREATED` events every run.
+- **Structurally guaranteed, not sampled:** every citation that *does* reach `CITATION_CREATED`
+  is real by construction — `app/grounding/citation_validator.py::validate_sentence` looks up each
+  `[doc_id section]` tag against that turn's actual evidence set; a tag that doesn't resolve is
+  rejected before it can ever become a citation event. This is a code-level guarantee, not a
+  measurement, and it is not the same thing as the ≥85%-support figure.
+- **Not measured, not claimed:** the ≥85% citation-support percentage itself. Producing that
+  number requires a sampled human or LLM entailment judgment over factual assertions, which
+  `docs/EVALUATION.md` §1 itself notes the harness does not perform. No such percentage is
+  reported anywhere in this document.
+
 ## 4. Retrieval Quality
 
 Precision/recall are computed per-scenario by `benchmarks/harness.py::_grade_scenario` from real

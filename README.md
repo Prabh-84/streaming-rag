@@ -219,7 +219,7 @@ These are offline/deterministic-provider results, not real-LLM benchmark-suite r
 
 **Real-provider attempts:** a full benchmark-suite run against the real, non-faked Gemini provider hit Gemini's free-tier rate limit (`429 RESOURCE_EXHAUSTED`) within the first scenario — an account/quota limitation, not a code defect; the built-in LLM-failure fallback degraded gracefully rather than crashing. Separately, single real end-to-end runs — one containerized (Gemini) and one through the frontend against the real Groq provider (`openai/gpt-oss-120b`) — each produced a genuine, correctly-grounded, cited answer via the real WebSocket API (retrieval, reranking, generation, citation, `ANSWER_VERSION_CREATED`, and telemetry all confirmed against the live provider). Neither is a substitute for a full real-provider benchmark-suite run.
 
-**Test suite:** `pytest -q` currently reports **409 passed, 5 skipped** (skips are opt-in integration tests that need a running Qdrant server or `RUN_MODEL_TESTS=1` real-model downloads).
+**Test suite:** `pytest -q` reports **409 passed, 5 skipped** with no local Qdrant server reachable, or **411 passed, 3 skipped** when one is (e.g. via `docker compose ... up qdrant`) — the 2 extra passes are `tests/integration/test_qdrant_server.py`'s opt-in tests. The remaining 3 skips always require `RUN_MODEL_TESTS=1` (real-model downloads) regardless of Qdrant availability. Exact counts depend on the environment, not on the code.
 
 ## Ablation Studies
 
@@ -343,6 +343,8 @@ curl http://localhost:8000/health   # {"status":"ok"} — liveness
 curl http://localhost:8000/ready    # {"status":"ready","qdrant":true,"ingestion":true,"embedder":true,"nlp":true} once warm
 ```
 
+`/ready` can take anywhere from under a minute to a few minutes on first startup after an image rebuild: the embedding model and reranker have no persistent cache volume, so each fresh container re-downloads them from Hugging Face rather than loading from disk. Start the stack a few minutes before you need it and poll `/ready` rather than assuming a fixed startup time.
+
 ### 5. Ingest a Corpus
 
 A demo corpus (`northstar_demo_extended`) is already bundled and ingested automatically at container startup. To add your own, place it at `data/corpus/<corpus_id>/` (layout: [`data/corpus/README.md`](data/corpus/README.md)) before building the image, or ingest into a running container:
@@ -440,7 +442,7 @@ All settings are centralized in `app/core/config.py` (`Settings`); full list wit
 - **Fake-provider testing** — every LLM-dependent test (`FakeDecomposer`, `FakeGenerationLLM`) and the offline benchmark run (`--use-fakes`) never make a real network call.
 - **Real-provider verification** — done manually against a live Docker deployment for Gemini and Groq (see [Evaluation](#evaluation)); not part of the automated test suite, since it requires a funded API key.
 
-Current verified result: **409 passed, 5 skipped**.
+Current verified result: **409 passed, 5 skipped** without a local Qdrant server reachable, **411 passed, 3 skipped** with one (see [Evaluation](#evaluation)) — never fewer, regardless of environment.
 
 ## Reproducibility
 

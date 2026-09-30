@@ -299,7 +299,12 @@ async def test_single_final_chunk_without_entity_still_waits(
     """is_final bypasses only the missing-stability-history gate, never the actionable-entity
     requirement - a final chunk carrying no recognizable domain entity still WAITs."""
     decision = await run_chunk(
-        session, "hello there", 0, retriever=retriever, embedder=embedder, settings=settings,
+        session,
+        "hello there",
+        0,
+        retriever=retriever,
+        embedder=embedder,
+        settings=settings,
         is_final=True,
     )
     assert decision.decision == ctrl.WAIT
@@ -315,7 +320,11 @@ async def test_final_chunk_bypass_never_applies_once_history_is_sufficient(
     the bypass cannot fire beyond a session's very first chunk (REQ-CTRL-01 unchanged for real
     multi-chunk streaming)."""
     await run_chunk(
-        session, "completely unrelated filler", 0, retriever=retriever, embedder=embedder,
+        session,
+        "completely unrelated filler",
+        0,
+        retriever=retriever,
+        embedder=embedder,
         settings=settings,
     )
     decision = await run_chunk(
