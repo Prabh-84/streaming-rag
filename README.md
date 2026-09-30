@@ -7,6 +7,8 @@ Built for the **Samsung PRISM Generative AI Hackathon 3rd Edition 2026–27, The
 [![CI](https://github.com/Prabh-84/streaming-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/Prabh-84/streaming-rag/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 
+**Demo video:** [Watch on Google Drive](https://drive.google.com/file/d/1YIH1CKF1u0_f08KOwih6ia3dZTlSk0R2/view?usp=sharing)
+
 Full frozen specification: [`PRD_TRD.md`](PRD_TRD.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/API.md`](docs/API.md), [`docs/TELEMETRY.md`](docs/TELEMETRY.md), [`docs/EVALUATION.md`](docs/EVALUATION.md). This README documents what is **actually implemented and verified** in the current repository, not the aspirational spec.
 
 ## Table of Contents
